@@ -1,9 +1,21 @@
 import { BadRequestException, ForbiddenException, Injectable } from '@nestjs/common';
 import { DateTime } from 'luxon';
-import { PickSide, SlipStatus } from '@prisma/client';
 
 import { PrismaService } from '../common/providers/prisma.service';
 import { SwipeActionType } from './dto/swipe-action.dto';
+
+const PICK_SIDE = {
+  ONE: 'ONE',
+  TWO: 'TWO',
+} as const;
+
+const SLIP_STATUS = {
+  PENDING: 'PENDING',
+  VALID: 'VALID',
+  LOCKED: 'LOCKED',
+  WON: 'WON',
+  LOST: 'LOST',
+} as const;
 
 function getUserDayStartUtc(timezone?: string | null) {
   const tz = timezone ?? 'UTC';
@@ -27,13 +39,13 @@ export class SwipeService {
       where: { userId: user.id, forDate },
       select: { cardId: true },
     });
-    const skippedIds = skipped.map((s) => s.cardId);
+    const skippedIds = skipped.map((s: { cardId: string }) => s.cardId);
 
     const pickedItems = await this.prisma.slipItem.findMany({
       where: { slip: { userId: user.id, forDate } },
       select: { cardId: true },
     });
-    const pickedIds = pickedItems.map((p) => p.cardId);
+    const pickedIds = pickedItems.map((p: { cardId: string }) => p.cardId);
 
     const seenIds = Array.from(new Set([...skippedIds, ...pickedIds]));
 
@@ -52,7 +64,7 @@ export class SwipeService {
     });
 
     return {
-      cards: cards.map((c) => ({
+      cards: cards.map((c: any) => ({
         cardId: c.id,
         matchId: c.matchId,
         sport: c.match.sport,
@@ -117,22 +129,22 @@ export class SwipeService {
     // Pick 1 or 2
     if (usage.swipesCount >= maxSwipes) throw new ForbiddenException('Daily swipe limit reached');
 
-    const side = params.action === SwipeActionType.PICK_ONE ? PickSide.ONE : PickSide.TWO;
+    const side = params.action === SwipeActionType.PICK_ONE ? PICK_SIDE.ONE : PICK_SIDE.TWO;
 
-    await this.prisma.$transaction(async (tx) => {
+    await this.prisma.$transaction(async (tx: any) => {
       const slip = await tx.slip.upsert({
         where: { userId_forDate: { userId: user.id, forDate } },
         create: {
           userId: user.id,
           forDate,
-          status: SlipStatus.PENDING,
+          status: SLIP_STATUS.PENDING,
           creditsRequired: creditsPerDay,
           creditsAllocated: 0,
         },
         update: {},
       });
 
-      if (slip.status !== SlipStatus.PENDING) throw new ForbiddenException('Slip is locked or resolved');
+      if (slip.status !== SLIP_STATUS.PENDING) throw new ForbiddenException('Slip is locked or resolved');
 
       await tx.slipItem.create({
         data: {

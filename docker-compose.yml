@@ -1,0 +1,13 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: swipster
+      POSTGRES_PASSWORD: swipster
+      POSTGRES_DB: swipster
+    ports:
+      - "5432:5432"
+    volumes:
+      - swipster_pgdata:/var/lib/postgresql/data
+volumes:
+  swipster_pgdata:

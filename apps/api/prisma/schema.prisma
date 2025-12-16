@@ -103,6 +103,9 @@ model Card {
   isActive    Boolean  @default(true)
   createdAt   DateTime @default(now())
 
+  slipItems   SlipItem[]
+  skippedBy   SkippedCard[]
+
   @@index([isActive, createdAt])
 }
 

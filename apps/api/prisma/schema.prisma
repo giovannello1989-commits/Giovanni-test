@@ -1,0 +1,217 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum SlipStatus {
+  PENDING
+  VALID
+  LOCKED
+  WON
+  LOST
+}
+
+enum MatchStatus {
+  SCHEDULED
+  STARTED
+  FINISHED
+}
+
+enum PickSide {
+  ONE
+  TWO
+}
+
+enum PickResult {
+  PENDING
+  WON
+  LOST
+}
+
+enum XpReason {
+  PICK_CORRECT
+  DAILY_COMPLETION
+  WELCOME_CHALLENGE
+}
+
+model User {
+  id               String   @id @default(cuid())
+  email            String   @unique
+  country          String?
+  timezone         String?
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  creditsDaily     Int      @default(100)
+  xpTotal          Int      @default(0)
+
+  nextDailyResetAt DateTime?
+
+  otps             EmailOtp[]
+  slips            Slip[]
+  dailyUsages      DailyUsage[]
+  skippedCards     SkippedCard[]
+  xpEvents         XpEvent[]
+  devices          Device[]
+}
+
+model EmailOtp {
+  id           String   @id @default(cuid())
+  email        String
+  codeHash     String
+  expiresAt    DateTime
+  usedAt       DateTime?
+  createdAt    DateTime @default(now())
+  requestIp    String?
+  attempts     Int      @default(0)
+
+  userId       String?
+  user         User?    @relation(fields: [userId], references: [id])
+
+  @@index([email, expiresAt])
+}
+
+model Match {
+  id           String      @id @default(cuid())
+  sport        String
+  league       String?
+  teamOne      String
+  teamTwo      String
+  startsAt     DateTime
+  status       MatchStatus @default(SCHEDULED)
+
+  finalTeamOneScore Int?
+  finalTeamTwoScore Int?
+
+  externalRef  String?     @unique
+
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  cards        Card[]
+}
+
+model Card {
+  id          String   @id @default(cuid())
+  matchId     String
+  match       Match    @relation(fields: [matchId], references: [id])
+
+  isActive    Boolean  @default(true)
+  createdAt   DateTime @default(now())
+
+  @@index([isActive, createdAt])
+}
+
+model Slip {
+  id                 String     @id @default(cuid())
+  userId             String
+  user               User       @relation(fields: [userId], references: [id])
+
+  forDate            DateTime   // normalized to user's local day start (stored as UTC)
+  status             SlipStatus @default(PENDING)
+
+  creditsRequired    Int
+  creditsAllocated   Int        @default(0)
+
+  lockedAt           DateTime?
+  resolvedAt         DateTime?
+
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  items              SlipItem[]
+
+  @@unique([userId, forDate])
+  @@index([status, forDate])
+}
+
+model SlipItem {
+  id        String     @id @default(cuid())
+  slipId    String
+  slip      Slip       @relation(fields: [slipId], references: [id], onDelete: Cascade)
+
+  cardId    String
+  card      Card       @relation(fields: [cardId], references: [id])
+
+  side      PickSide
+  result    PickResult @default(PENDING)
+  credits   Int        @default(0)
+
+  createdAt DateTime @default(now())
+
+  @@unique([slipId, cardId])
+  @@index([cardId])
+}
+
+model DailyUsage {
+  id          String   @id @default(cuid())
+  userId      String
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  forDate     DateTime // normalized to user's local day start (stored as UTC)
+  swipesCount Int      @default(0)
+  skipsCount  Int      @default(0)
+
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@unique([userId, forDate])
+  @@index([forDate])
+}
+
+model SkippedCard {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  cardId    String
+  card      Card     @relation(fields: [cardId], references: [id], onDelete: Cascade)
+
+  forDate   DateTime // normalized to user's local day start (stored as UTC)
+  createdAt DateTime @default(now())
+
+  @@unique([userId, forDate, cardId])
+  @@index([forDate])
+}
+
+model XpEvent {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  amount    Int
+  reason    XpReason
+  meta      Json?
+
+  createdAt DateTime @default(now())
+
+  @@index([userId, createdAt])
+}
+
+model Device {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  provider  String   // "fcm" | "onesignal" (v1 keeps it flexible)
+  token     String
+
+  createdAt DateTime @default(now())
+
+  @@unique([provider, token])
+  @@index([userId])
+}
+
+model AppSettings {
+  id             Int      @id @default(1)
+  maxSwipesPerDay Int     @default(20)
+  maxSkipsPerDay  Int     @default(3)
+  creditsPerDay   Int     @default(100)
+
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+}

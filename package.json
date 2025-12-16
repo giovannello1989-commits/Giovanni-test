@@ -1,0 +1,15 @@
+{
+  "name": "swipster",
+  "private": true,
+  "version": "0.1.0",
+  "workspaces": [
+    "apps/*"
+  ],
+  "scripts": {
+    "dev:api": "npm run -w @swipster/api dev",
+    "build:api": "npm run -w @swipster/api build",
+    "start:api": "npm run -w @swipster/api start",
+    "prisma:generate": "npm run -w @swipster/api prisma:generate",
+    "prisma:migrate": "npm run -w @swipster/api prisma:migrate"
+  }
+}

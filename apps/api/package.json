@@ -7,8 +7,10 @@
     "dev": "ts-node-dev --respawn --transpile-only -r tsconfig-paths/register src/main.ts",
     "build": "tsc -p tsconfig.build.json",
     "start": "node dist/main.js",
+    "start:prod": "node -e \"console.log('Starting Swipster API…')\" && node dist/main.js",
     "prisma:generate": "prisma generate",
     "prisma:migrate": "prisma migrate dev",
+    "prisma:dbpush": "prisma db push",
     "prisma:studio": "prisma studio"
   },
   "dependencies": {

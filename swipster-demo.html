@@ -1,0 +1,318 @@
+<!doctype html>
+<html lang="it">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="theme-color" content="#0B0F14" />
+  <title>Swipster – Demo</title>
+  <style>
+    :root{
+      color-scheme: dark;
+      --bg:#0B0F14;
+      --bg2:#0F1620;
+      --text:#E7EEF8;
+      --sub:#93A4B8;
+      --stroke:rgba(255,255,255,.10);
+      --stroke2:rgba(255,255,255,.16);
+      --accent:#1D9BF0;
+      --good:#23D18B;
+      --bad:#FF4D6D;
+      --warn:#F5C542;
+      --r:22px;
+      --pill:999px;
+    }
+    *{box-sizing:border-box}
+    html,body{height:100%}
+    body{
+      margin:0;
+      background:var(--bg);
+      color:var(--text);
+      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial;
+      display:flex;
+      justify-content:center;
+    }
+    .wrap{width:100%; max-width:520px; padding:16px; padding-bottom:92px;}
+    .top{display:flex; align-items:flex-end; justify-content:space-between; margin:8px 0 16px;}
+    .brand{font-weight:950; letter-spacing:-.2px; font-size:18px}
+    .meta{color:var(--sub); font-weight:900; font-size:12px}
+
+    .stage{position:relative; height:min(72vh, 640px);}
+    .card{
+      position:absolute; inset:0;
+      border-radius:var(--r);
+      border:1px solid var(--stroke2);
+      background:var(--bg2);
+      overflow:hidden;
+      touch-action:none;
+      user-select:none;
+      transform:translate3d(0,0,0);
+      will-change:transform;
+    }
+    .card::before{
+      content:"";
+      position:absolute; inset:-140px;
+      background:
+        radial-gradient(circle at 20% 10%, rgba(29,155,240,0.22), transparent 50%),
+        radial-gradient(circle at 90% 90%, rgba(255,77,109,0.18), transparent 55%);
+    }
+    .cardInner{position:relative; height:100%; padding:16px; display:flex; flex-direction:column;}
+    .row{display:flex; align-items:center; justify-content:space-between; gap:10px}
+    .pill{padding:8px 12px; border-radius:var(--pill); border:1px solid var(--stroke); background:rgba(255,255,255,.04); font-weight:950; font-size:12px; white-space:nowrap}
+    .small{color:var(--sub); font-weight:900; font-size:12px; letter-spacing:.3px}
+    .center{flex:1; display:grid; place-items:center; text-align:center; padding:0 10px}
+    .team{font-size:32px; font-weight:980; letter-spacing:-.6px}
+    .vs{margin:10px 0; color:var(--sub); font-size:12px; font-weight:950; letter-spacing:1.4px}
+    .footer{display:flex; justify-content:center; gap:10px; color:var(--sub); font-size:12px; font-weight:900}
+
+    .badge{position:absolute; top:16px; padding:8px 12px; border-radius:var(--pill); border:1px solid rgba(255,255,255,.14); background:rgba(11,15,20,.70); font-weight:980; letter-spacing:1px; font-size:12px; opacity:0;}
+    .badge.left{left:16px}
+    .badge.right{right:16px}
+
+    .actions{display:flex; gap:10px; margin-top:14px}
+    .btn{
+      flex:1; height:46px; border-radius:var(--pill);
+      border:1px solid var(--stroke2);
+      background:rgba(255,255,255,.06);
+      color:var(--text);
+      font-weight:980; letter-spacing:.2px;
+      cursor:pointer;
+    }
+    .btn.good{background:rgba(35,209,139,.16); border-color:rgba(255,255,255,.10); color:var(--good)}
+    .btn.bad{background:rgba(255,77,109,.16); border-color:rgba(255,255,255,.10); color:var(--bad)}
+
+    .panel{margin-top:14px; border:1px solid var(--stroke); background:var(--bg2); border-radius:var(--r); padding:14px}
+    .grid{display:flex; justify-content:space-between; gap:12px}
+    .k{color:var(--sub); font-size:11px; font-weight:950; letter-spacing:.3px; text-transform:uppercase}
+    .v{margin-top:6px; font-weight:980; font-size:16px}
+
+    .pick{margin-top:12px; padding-top:12px; border-top:1px solid var(--stroke)}
+    .pickTitle{font-weight:950; font-size:14px}
+    .pickSub{margin-top:6px; color:var(--sub); font-weight:900; font-size:12px}
+
+    input{
+      width:100%; height:44px;
+      border-radius:16px;
+      border:1px solid var(--stroke);
+      background:var(--bg2);
+      color:var(--text);
+      padding:0 12px;
+      outline:none;
+      margin-top:10px;
+      font-weight:900;
+    }
+
+    .legal{margin-top:12px; color:var(--sub); font-size:12px; line-height:1.35}
+
+    .toast{position:fixed; left:0; right:0; bottom:10px; display:flex; justify-content:center; pointer-events:none;}
+    .toast > div{max-width:520px; width:calc(100% - 24px); background:rgba(15,22,32,.88); border:1px solid var(--stroke); border-radius:16px; padding:10px 12px; backdrop-filter: blur(10px); color:var(--sub); font-size:12px; font-weight:900;}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="top">
+      <div class="brand">Swipster <span style="color:var(--sub); font-weight:900">· demo</span></div>
+      <div class="meta">Prematch only · Virtual credits</div>
+    </div>
+
+    <div class="stage">
+      <div id="nextCard" class="card" style="transform:scale(.985) translateY(8px); opacity:.9"></div>
+      <div id="topCard" class="card"></div>
+      <div id="badgeLeft" class="badge left" style="color:var(--bad)">PICK 2</div>
+      <div id="badgeRight" class="badge right" style="color:var(--good)">PICK 1</div>
+    </div>
+
+    <div class="actions">
+      <button class="btn" id="skipBtn">Skip</button>
+      <button class="btn bad" id="pick2Btn">Pick 2</button>
+      <button class="btn good" id="pick1Btn">Pick 1</button>
+    </div>
+
+    <div class="panel" id="slipPanel">
+      <div class="grid">
+        <div>
+          <div class="k">Status</div>
+          <div class="v" id="status">PENDING</div>
+        </div>
+        <div>
+          <div class="k">Credits</div>
+          <div class="v"><span id="allocated">0</span>/<span id="required">100</span></div>
+        </div>
+        <div>
+          <div class="k">Left</div>
+          <div class="v" id="left" style="color:var(--warn)">100</div>
+        </div>
+      </div>
+
+      <div id="picks"></div>
+
+      <div class="legal">
+        Demo offline: non chiama nessun server. Virtual credits only. No odds. No real money.
+      </div>
+    </div>
+  </div>
+
+  <div class="toast" id="toast" style="display:none"><div id="toastMsg"></div></div>
+
+<script>
+  const requiredCredits = 100;
+  const cards = [
+    { id: 'c1', sport:'Football', league:'Demo League', teamOne:'Lions FC', teamTwo:'Tigers FC', startsAt: new Date(Date.now()+6*3600e3) },
+    { id: 'c2', sport:'Basketball', league:'Demo League', teamOne:'City Hoops', teamTwo:'Valley Stars', startsAt: new Date(Date.now()+10*3600e3) },
+  ];
+
+  const picks = []; // {cardId, side:'ONE'|'TWO', credits}
+
+  const topEl = document.getElementById('topCard');
+  const nextEl = document.getElementById('nextCard');
+  const badgeL = document.getElementById('badgeLeft');
+  const badgeR = document.getElementById('badgeRight');
+
+  const allocatedEl = document.getElementById('allocated');
+  const requiredEl = document.getElementById('required');
+  const leftEl = document.getElementById('left');
+  const statusEl = document.getElementById('status');
+  const picksEl = document.getElementById('picks');
+
+  requiredEl.textContent = String(requiredCredits);
+
+  function kickoff(d){
+    const hh = String(d.getHours()).padStart(2,'0');
+    const mm = String(d.getMinutes()).padStart(2,'0');
+    return `${hh}:${mm}`;
+  }
+
+  function renderCard(container, c){
+    if(!c){
+      container.innerHTML = `<div class="cardInner"><div class="center"><div><div style="font-size:18px; font-weight:980">You’re out of cards</div><div style="margin-top:8px; color:var(--sub); font-weight:900; font-size:13px">Demo deck finished.</div></div></div></div>`;
+      return;
+    }
+    container.innerHTML = `
+      <div class="cardInner">
+        <div class="row">
+          <div class="small">${c.sport}${c.league ? ` · ${c.league}` : ''}</div>
+          <div class="pill">Kickoff ${kickoff(c.startsAt)}</div>
+        </div>
+        <div class="center">
+          <div>
+            <div class="team">${c.teamOne}</div>
+            <div class="vs">VS</div>
+            <div class="team">${c.teamTwo}</div>
+          </div>
+        </div>
+        <div class="footer"><div>Right: Pick 1</div><div>·</div><div>Left: Pick 2</div></div>
+      </div>
+    `;
+  }
+
+  function toast(msg){
+    const t = document.getElementById('toast');
+    const m = document.getElementById('toastMsg');
+    m.textContent = msg;
+    t.style.display = 'flex';
+    clearTimeout(toast._t);
+    toast._t = setTimeout(()=>{t.style.display='none'}, 1600);
+  }
+
+  function updateSlip(){
+    const allocated = picks.reduce((s,p)=>s+(p.credits||0),0);
+    allocatedEl.textContent = String(allocated);
+    const left = Math.max(0, requiredCredits-allocated);
+    leftEl.textContent = String(left);
+    leftEl.style.color = left===0 ? 'var(--good)' : 'var(--warn)';
+    statusEl.textContent = allocated===requiredCredits ? 'VALID' : 'PENDING';
+
+    picksEl.innerHTML = picks.map((p, idx) => {
+      const c = cards.find(x=>x.id===p.cardId);
+      const pickNum = p.side==='ONE' ? '1' : '2';
+      return `
+        <div class="pick">
+          <div class="pickTitle">${c ? `${c.teamOne} vs ${c.teamTwo}` : 'Pick'}</div>
+          <div class="pickSub">Pick: ${pickNum}</div>
+          <input inputmode="numeric" pattern="[0-9]*" placeholder="0" value="${p.credits||0}" data-idx="${idx}" />
+        </div>
+      `;
+    }).join('');
+
+    picksEl.querySelectorAll('input').forEach(inp => {
+      inp.addEventListener('input', (e)=>{
+        const i = Number(e.target.getAttribute('data-idx'));
+        const v = String(e.target.value||'').replace(/\D/g,'').slice(0,4);
+        e.target.value = v;
+        picks[i].credits = Math.max(0, Number(v||0));
+        updateSlip();
+      });
+    });
+  }
+
+  let idx = 0;
+  function render(){
+    const top = cards[idx];
+    const next = cards[idx+1];
+    renderCard(topEl, top);
+    renderCard(nextEl, next);
+    // reset transform/badges
+    topEl.style.transform = 'translate3d(0,0,0) rotate(0deg)';
+    badgeL.style.opacity = 0;
+    badgeR.style.opacity = 0;
+  }
+
+  function choose(side){
+    const c = cards[idx];
+    if(!c) return;
+    picks.push({ cardId: c.id, side, credits: 0 });
+    updateSlip();
+    toast(side==='ONE' ? 'Picked 1' : 'Picked 2');
+    idx += 1;
+    render();
+  }
+
+  function skip(){
+    const c = cards[idx];
+    if(!c) return;
+    toast('Skipped');
+    idx += 1;
+    render();
+  }
+
+  // pointer swipe
+  let startX=0, startY=0, dragging=false;
+  topEl.addEventListener('pointerdown', (e)=>{
+    dragging=true;
+    startX=e.clientX;
+    startY=e.clientY;
+    topEl.setPointerCapture(e.pointerId);
+  });
+  topEl.addEventListener('pointermove', (e)=>{
+    if(!dragging) return;
+    const dx=e.clientX-startX;
+    const dy=e.clientY-startY;
+    const rot = Math.max(-12, Math.min(12, dx/20));
+    topEl.style.transform = `translate3d(${dx}px, ${dy}px, 0) rotate(${rot}deg)`;
+    const throwX = 220;
+    badgeR.style.opacity = dx>0 ? Math.min(1, Math.max(0, dx/throwX)) : 0;
+    badgeL.style.opacity = dx<0 ? Math.min(1, Math.max(0, -dx/throwX)) : 0;
+  });
+  topEl.addEventListener('pointerup', (e)=>{
+    if(!dragging) return;
+    dragging=false;
+    const dx=e.clientX-startX;
+    const throwX = 220;
+    if(dx>throwX){ choose('ONE'); return; }
+    if(dx<-throwX){ choose('TWO'); return; }
+    // snap back
+    topEl.style.transition = 'transform 160ms cubic-bezier(.2,.8,.2,1)';
+    topEl.style.transform = 'translate3d(0,0,0) rotate(0deg)';
+    badgeL.style.opacity = 0;
+    badgeR.style.opacity = 0;
+    setTimeout(()=>{ topEl.style.transition=''; }, 170);
+  });
+
+  document.getElementById('pick1Btn').addEventListener('click', ()=>choose('ONE'));
+  document.getElementById('pick2Btn').addEventListener('click', ()=>choose('TWO'));
+  document.getElementById('skipBtn').addEventListener('click', ()=>skip());
+
+  render();
+  updateSlip();
+</script>
+</body>
+</html>

@@ -74,7 +74,7 @@ RISK_PROFILES: dict[str, RiskProfile] = {
 @dataclass(frozen=True)
 class AppConfig:
     telegram_bot_token: str
-    telegram_allowed_chat_id: int
+    telegram_allowed_chat_id: int | None
 
     tz_name: str
     tz: ZoneInfo
@@ -108,12 +108,13 @@ def load_config() -> AppConfig:
             "Missing TELEGRAM_BOT_TOKEN env var. "
             f"Env keys seen with prefix TELEGRAM_: {keys}"
         )
-    if not allowed_chat_id:
-        keys = _present_env_keys("TELEGRAM_")
-        raise RuntimeError(
-            "Missing TELEGRAM_ALLOWED_CHAT_ID env var. "
-            f"Env keys seen with prefix TELEGRAM_: {keys}"
-        )
+
+    allowed_chat_id_int: int | None = None
+    if allowed_chat_id:
+        try:
+            allowed_chat_id_int = int(str(allowed_chat_id).strip())
+        except Exception:
+            allowed_chat_id_int = None
 
     tz_name = _env("TZ", "Europe/Rome") or "Europe/Rome"
     tz = ZoneInfo(tz_name)
@@ -143,7 +144,7 @@ def load_config() -> AppConfig:
 
     return AppConfig(
         telegram_bot_token=token,
-        telegram_allowed_chat_id=int(allowed_chat_id),
+        telegram_allowed_chat_id=allowed_chat_id_int,
         tz_name=tz_name,
         tz=tz,
         window_start=window_start,

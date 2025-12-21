@@ -1,0 +1,29 @@
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+.venv/
+venv/
+ENV/
+env/
+pip-wheel-metadata/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# local env
+.env
+
+# sqlite db
+bot.db
+*.sqlite
+*.sqlite3
+
+# editor
+.DS_Store
+.idea/
+.vscode/
+

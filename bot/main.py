@@ -11,7 +11,9 @@ from telegram.ext import (
     Application,
     CallbackQueryHandler,
     CommandHandler,
+    MessageHandler,
     ContextTypes,
+    filters,
 )
 
 from bot.config import RISK_PROFILES, AppConfig, is_within_operating_window, load_config
@@ -29,6 +31,25 @@ logger = logging.getLogger("bot")
 
 RESET_CONFIRM_CB = "reset_confirm"
 RESET_CANCEL_CB = "reset_cancel"
+
+SETUP_START_CB = "setup_start"
+SETUP_CANCEL_CB = "setup_cancel"
+
+SETUP_BASE_PREFIX = "setup_base:"
+SETUP_RISK_PREFIX = "setup_risk:"
+SETUP_SCAN_PREFIX = "setup_scan:"
+SETUP_PAIRS_PREFIX = "setup_pairs:"
+SETUP_HARDMIN_PREFIX = "setup_hardmin:"
+SETUP_CONFIRM_CB = "setup_confirm"
+
+SETUP_STEP_NONE = None
+SETUP_STEP_BASE = "base_currency"
+SETUP_STEP_CAPITAL = "starting_capital"
+SETUP_STEP_RISK = "risk_mode"
+SETUP_STEP_SCAN = "scan_interval_seconds"
+SETUP_STEP_PAIRS = "pairs_limit"
+SETUP_STEP_HARDMIN = "hard_close_minute"
+SETUP_STEP_CONFIRM = "confirm"
 
 
 def _authorized(cfg: AppConfig, update: Update) -> bool:
@@ -55,6 +76,18 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     store: Storage = context.application.bot_data["store"]
     st = await asyncio.to_thread(store.get_settings)
     risk = RISK_PROFILES.get(st["risk_mode"], RISK_PROFILES["aggressive"])
+
+    # If user hasn't configured starting capital yet, offer setup wizard.
+    if float(st.get("starting_capital", 0.0)) <= 0.0:
+        kb = InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("Inizia setup guidato", callback_data=SETUP_START_CB)],
+            ]
+        )
+        await update.message.reply_text(
+            "Prima configurazione: vuoi impostare capitale/valuta/risk con un wizard step-by-step?",
+            reply_markup=kb,
+        )
 
     now = datetime.now(cfg.tz)
     msg = (
@@ -279,6 +312,268 @@ async def on_reset_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         context.application.bot_data["last_signal_by_symbol"] = {}
         context.application.bot_data["last_mom15_sign"] = {}
         await q.edit_message_text("Reset completato.")
+
+def _setup_keyboard_base() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("EUR", callback_data=f"{SETUP_BASE_PREFIX}EUR"),
+                InlineKeyboardButton("USD", callback_data=f"{SETUP_BASE_PREFIX}USD"),
+                InlineKeyboardButton("GBP", callback_data=f"{SETUP_BASE_PREFIX}GBP"),
+            ],
+            [InlineKeyboardButton("Annulla", callback_data=SETUP_CANCEL_CB)],
+        ]
+    )
+
+
+def _setup_keyboard_risk() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("Aggressive", callback_data=f"{SETUP_RISK_PREFIX}aggressive"),
+                InlineKeyboardButton("Normal", callback_data=f"{SETUP_RISK_PREFIX}normal"),
+                InlineKeyboardButton("Conservative", callback_data=f"{SETUP_RISK_PREFIX}conservative"),
+            ],
+            [InlineKeyboardButton("Annulla", callback_data=SETUP_CANCEL_CB)],
+        ]
+    )
+
+
+def _setup_keyboard_scan() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("30s", callback_data=f"{SETUP_SCAN_PREFIX}30"),
+                InlineKeyboardButton("60s", callback_data=f"{SETUP_SCAN_PREFIX}60"),
+                InlineKeyboardButton("120s", callback_data=f"{SETUP_SCAN_PREFIX}120"),
+            ],
+            [InlineKeyboardButton("Annulla", callback_data=SETUP_CANCEL_CB)],
+        ]
+    )
+
+
+def _setup_keyboard_pairs() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("20", callback_data=f"{SETUP_PAIRS_PREFIX}20"),
+                InlineKeyboardButton("50", callback_data=f"{SETUP_PAIRS_PREFIX}50"),
+                InlineKeyboardButton("100", callback_data=f"{SETUP_PAIRS_PREFIX}100"),
+            ],
+            [InlineKeyboardButton("Annulla", callback_data=SETUP_CANCEL_CB)],
+        ]
+    )
+
+
+def _setup_keyboard_hardmin() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("19:45", callback_data=f"{SETUP_HARDMIN_PREFIX}45"),
+                InlineKeyboardButton("19:50", callback_data=f"{SETUP_HARDMIN_PREFIX}50"),
+                InlineKeyboardButton("19:55", callback_data=f"{SETUP_HARDMIN_PREFIX}55"),
+            ],
+            [InlineKeyboardButton("Annulla", callback_data=SETUP_CANCEL_CB)],
+        ]
+    )
+
+
+async def cmd_setup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    cfg: AppConfig = context.application.bot_data["cfg"]
+    if not _authorized(cfg, update):
+        return
+    store: Storage = context.application.bot_data["store"]
+    await asyncio.to_thread(store.set_onboarding, SETUP_STEP_BASE, {})
+    await update.message.reply_text(
+        "*Setup guidato*\nStep 1/6: scegli la valuta base.",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=_setup_keyboard_base(),
+    )
+
+
+async def _setup_advance_prompt(context: ContextTypes.DEFAULT_TYPE, step: str) -> None:
+    cfg: AppConfig = context.application.bot_data["cfg"]
+    if step == SETUP_STEP_CAPITAL:
+        await context.application.bot.send_message(
+            chat_id=cfg.telegram_allowed_chat_id,
+            text="Step 2/6: scrivi il *capitale iniziale* (solo numero). Esempio: `1000`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    elif step == SETUP_STEP_RISK:
+        await context.application.bot.send_message(
+            chat_id=cfg.telegram_allowed_chat_id,
+            text="Step 3/6: scegli il profilo rischio (soglie momentum + trailing).",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=_setup_keyboard_risk(),
+        )
+    elif step == SETUP_STEP_SCAN:
+        await context.application.bot.send_message(
+            chat_id=cfg.telegram_allowed_chat_id,
+            text="Step 4/6: ogni quanto scansionare i simboli?",
+            reply_markup=_setup_keyboard_scan(),
+        )
+    elif step == SETUP_STEP_PAIRS:
+        await context.application.bot.send_message(
+            chat_id=cfg.telegram_allowed_chat_id,
+            text="Step 5/6: quanti simboli scansionare (per performance)?",
+            reply_markup=_setup_keyboard_pairs(),
+        )
+    elif step == SETUP_STEP_HARDMIN:
+        await context.application.bot.send_message(
+            chat_id=cfg.telegram_allowed_chat_id,
+            text="Step 6/6: a che ora vuoi l’alert *CHIUDI TUTTO*?",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=_setup_keyboard_hardmin(),
+        )
+    elif step == SETUP_STEP_CONFIRM:
+        store: Storage = context.application.bot_data["store"]
+        ob = await asyncio.to_thread(store.get_onboarding)
+        data = ob.get("data", {})
+        kb = InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("Conferma e salva", callback_data=SETUP_CONFIRM_CB)],
+                [InlineKeyboardButton("Annulla", callback_data=SETUP_CANCEL_CB)],
+            ]
+        )
+        await context.application.bot.send_message(
+            chat_id=cfg.telegram_allowed_chat_id,
+            text=(
+                "*Riepilogo setup*\n"
+                f"- base_currency: `{data.get('base_currency')}`\n"
+                f"- starting_capital: `{data.get('starting_capital')}`\n"
+                f"- risk_mode: `{data.get('risk_mode')}`\n"
+                f"- scan_interval_seconds: `{data.get('scan_interval_seconds')}`\n"
+                f"- pairs_limit: `{data.get('pairs_limit')}`\n"
+                f"- hard_close_minute: `{data.get('hard_close_minute')}`\n"
+            ),
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=kb,
+        )
+
+
+async def on_setup_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    cfg: AppConfig = context.application.bot_data["cfg"]
+    if not _authorized(cfg, update):
+        return
+    q = update.callback_query
+    if not q:
+        return
+    await q.answer()
+
+    store: Storage = context.application.bot_data["store"]
+
+    if q.data == SETUP_START_CB:
+        await asyncio.to_thread(store.set_onboarding, SETUP_STEP_BASE, {})
+        await q.edit_message_text(
+            "Setup guidato: Step 1/6: scegli la valuta base.",
+            reply_markup=_setup_keyboard_base(),
+        )
+        return
+
+    if q.data == SETUP_CANCEL_CB:
+        await asyncio.to_thread(store.clear_onboarding)
+        await q.edit_message_text("Setup annullato.")
+        return
+
+    ob = await asyncio.to_thread(store.get_onboarding)
+    data = ob.get("data", {})
+
+    if q.data.startswith(SETUP_BASE_PREFIX):
+        cur = q.data.split(":", 1)[1].upper()
+        data["base_currency"] = cur
+        await asyncio.to_thread(store.set_onboarding, SETUP_STEP_CAPITAL, data)
+        await q.edit_message_text(f"Valuta base impostata: {cur}")
+        await _setup_advance_prompt(context, SETUP_STEP_CAPITAL)
+        return
+
+    if q.data.startswith(SETUP_RISK_PREFIX):
+        mode = q.data.split(":", 1)[1].lower()
+        if mode not in RISK_PROFILES:
+            return
+        data["risk_mode"] = mode
+        await asyncio.to_thread(store.set_onboarding, SETUP_STEP_SCAN, data)
+        await q.edit_message_text(f"Risk mode impostato: {mode}")
+        await _setup_advance_prompt(context, SETUP_STEP_SCAN)
+        return
+
+    if q.data.startswith(SETUP_SCAN_PREFIX):
+        v = _parse_float(q.data.split(":", 1)[1])
+        if v is None or v <= 0:
+            return
+        data["scan_interval_seconds"] = int(v)
+        await asyncio.to_thread(store.set_onboarding, SETUP_STEP_PAIRS, data)
+        await q.edit_message_text(f"Scan interval impostato: {int(v)}s")
+        await _setup_advance_prompt(context, SETUP_STEP_PAIRS)
+        return
+
+    if q.data.startswith(SETUP_PAIRS_PREFIX):
+        v = _parse_float(q.data.split(":", 1)[1])
+        if v is None or v <= 0:
+            return
+        data["pairs_limit"] = int(v)
+        await asyncio.to_thread(store.set_onboarding, SETUP_STEP_HARDMIN, data)
+        await q.edit_message_text(f"Pairs limit impostato: {int(v)}")
+        await _setup_advance_prompt(context, SETUP_STEP_HARDMIN)
+        return
+
+    if q.data.startswith(SETUP_HARDMIN_PREFIX):
+        v = _parse_float(q.data.split(":", 1)[1])
+        if v is None or v < 0 or v >= 60:
+            return
+        data["hard_close_minute"] = int(v)
+        await asyncio.to_thread(store.set_onboarding, SETUP_STEP_CONFIRM, data)
+        await q.edit_message_text(f"Hard-close alert impostato: 19:{int(v):02d}")
+        await _setup_advance_prompt(context, SETUP_STEP_CONFIRM)
+        return
+
+    if q.data == SETUP_CONFIRM_CB:
+        # Save into settings + advise which env vars remain required
+        st = await asyncio.to_thread(store.get_settings)
+        base = data.get("base_currency", st.get("base_currency", "EUR"))
+        capital = float(data.get("starting_capital", st.get("starting_capital", 0.0)))
+        risk_mode = data.get("risk_mode", st.get("risk_mode", "aggressive"))
+        await asyncio.to_thread(
+            store.update_settings,
+            base_currency=base,
+            starting_capital=capital,
+            risk_mode=risk_mode,
+        )
+
+        # Apply runtime-only settings by updating cfg in memory for this process.
+        # Note: scan interval/pairs limit/hard-close minute are loaded from ENV at startup; we keep them in onboarding summary
+        # and show the user what to set if they want to persist via ENV.
+        await asyncio.to_thread(store.clear_onboarding)
+        await q.edit_message_text(
+            "Setup salvato ✅\n\n"
+            "Se vuoi rendere persistenti anche *scan interval*, *pairs limit* e *hard-close minute* tra deploy, "
+            "impostali come ENV: `SCAN_INTERVAL_SECONDS`, `PAIRS_LIMIT`, `HARD_CLOSE_MINUTE`.",
+        )
+        return
+
+
+async def on_setup_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    cfg: AppConfig = context.application.bot_data["cfg"]
+    if not _authorized(cfg, update):
+        return
+    if not update.message or not update.message.text:
+        return
+
+    store: Storage = context.application.bot_data["store"]
+    ob = await asyncio.to_thread(store.get_onboarding)
+    step = ob.get("step")
+    data = ob.get("data", {})
+    if step != SETUP_STEP_CAPITAL:
+        return
+
+    amt = _parse_float(update.message.text.strip())
+    if amt is None or amt < 0:
+        await update.message.reply_text("Valore non valido. Scrivi solo un numero, es. `1000`", parse_mode=ParseMode.MARKDOWN)
+        return
+
+    data["starting_capital"] = float(amt)
+    await asyncio.to_thread(store.set_onboarding, SETUP_STEP_RISK, data)
+    await update.message.reply_text(f"Capitale iniziale impostato: {amt:.2f}")
+    await _setup_advance_prompt(context, SETUP_STEP_RISK)
 
 
 async def _compute_pnl_snapshot(
@@ -513,7 +808,10 @@ def build_app(cfg: AppConfig) -> Application:
     app.add_handler(CommandHandler("sell", cmd_sell))
     app.add_handler(CommandHandler("portfolio", cmd_portfolio))
     app.add_handler(CommandHandler("reset", cmd_reset))
-    app.add_handler(CallbackQueryHandler(on_reset_callback))
+    app.add_handler(CommandHandler("setup", cmd_setup))
+    app.add_handler(CallbackQueryHandler(on_reset_callback, pattern=f"^{RESET_CONFIRM_CB}$|^{RESET_CANCEL_CB}$"))
+    app.add_handler(CallbackQueryHandler(on_setup_callback, pattern=r"^(setup_|setup_base:|setup_risk:|setup_scan:|setup_pairs:|setup_hardmin:)"))
+    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), on_setup_text))
 
     # Scheduling
     jq = app.job_queue

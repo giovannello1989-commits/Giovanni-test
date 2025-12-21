@@ -64,6 +64,7 @@ Se i segnali non arrivano o `get_pairs()` restituisce lista vuota, quasi certame
 ## Comandi Telegram
 
 - `/start` stato rapido
+- `/setup` setup guidato (stile “registration page” in chat)
 - `/setcapital 100 EUR`
 - `/setrisk aggressive|normal|conservative`
 - `/buy BTC-EUR 20 at 43000`

@@ -4,6 +4,8 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
+import json
+
 
 
 DEFAULT_SETTINGS = {
@@ -83,6 +85,15 @@ class Storage:
                 )
                 """
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS onboarding (
+                    id INTEGER PRIMARY KEY CHECK (id = 1),
+                    step TEXT,
+                    data_json TEXT
+                )
+                """
+            )
             # Ensure singleton settings row exists
             row = conn.execute("SELECT id FROM settings WHERE id=1").fetchone()
             if row is None:
@@ -97,6 +108,11 @@ class Storage:
                         DEFAULT_SETTINGS["risk_mode"],
                         DEFAULT_SETTINGS["paused"],
                     ),
+                )
+            row2 = conn.execute("SELECT id FROM onboarding WHERE id=1").fetchone()
+            if row2 is None:
+                conn.execute(
+                    "INSERT INTO onboarding (id, step, data_json) VALUES (1, NULL, NULL)"
                 )
 
     def get_settings(self) -> dict:
@@ -120,6 +136,7 @@ class Storage:
         with self._connect() as conn:
             conn.execute("DELETE FROM trades")
             conn.execute("DELETE FROM positions")
+            conn.execute("UPDATE onboarding SET step=NULL, data_json=NULL WHERE id=1")
             conn.execute(
                 """
                 UPDATE settings
@@ -133,6 +150,32 @@ class Storage:
                     DEFAULT_SETTINGS["paused"],
                 ),
             )
+
+    # --- Onboarding (setup wizard) ---
+    def get_onboarding(self) -> dict:
+        with self._connect() as conn:
+            row = conn.execute("SELECT step, data_json FROM onboarding WHERE id=1").fetchone()
+            if row is None:
+                return {"step": None, "data": {}}
+            data = {}
+            if row["data_json"]:
+                try:
+                    data = json.loads(row["data_json"])
+                except Exception:
+                    data = {}
+            return {"step": row["step"], "data": data}
+
+    def set_onboarding(self, step: str | None, data: dict) -> None:
+        payload = json.dumps(data, ensure_ascii=False)
+        with self._connect() as conn:
+            conn.execute(
+                "UPDATE onboarding SET step=?, data_json=? WHERE id=1",
+                (step, payload),
+            )
+
+    def clear_onboarding(self) -> None:
+        with self._connect() as conn:
+            conn.execute("UPDATE onboarding SET step=NULL, data_json=NULL WHERE id=1")
 
     # --- Trades / Positions ---
     def _now_utc_iso(self) -> str:

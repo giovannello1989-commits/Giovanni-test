@@ -9,7 +9,11 @@ from zoneinfo import ZoneInfo
 def _env(name: str, default: str | None = None) -> str | None:
     val = os.getenv(name)
     if val is None or val == "":
-        return default
+        # Railway/users sometimes set vars in lowercase by mistake.
+        # Be forgiving and also check lowercase version.
+        val = os.getenv(name.lower())
+        if val is None or val == "":
+            return default
     return val
 
 

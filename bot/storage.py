@@ -13,6 +13,11 @@ DEFAULT_SETTINGS = {
     "starting_capital": 0.0,
     "risk_mode": "aggressive",
     "paused": 0,
+    "scan_interval_seconds": 60,
+    "pairs_limit": 50,
+    "hard_close_minute": 55,
+    "revolutx_base_url": "",
+    "revolutx_base_path": "",
 }
 
 
@@ -109,6 +114,19 @@ class Storage:
                         DEFAULT_SETTINGS["paused"],
                     ),
                 )
+            # Lightweight migration for new columns
+            cols = [r["name"] for r in conn.execute("PRAGMA table_info(settings)").fetchall()]
+            def _ensure_col(name: str, ddl: str, default_val):
+                if name in cols:
+                    return
+                conn.execute(f"ALTER TABLE settings ADD COLUMN {ddl}")
+                conn.execute(f"UPDATE settings SET {name}=? WHERE id=1", (default_val,))
+
+            _ensure_col("scan_interval_seconds", "scan_interval_seconds INTEGER NOT NULL DEFAULT 60", DEFAULT_SETTINGS["scan_interval_seconds"])
+            _ensure_col("pairs_limit", "pairs_limit INTEGER NOT NULL DEFAULT 50", DEFAULT_SETTINGS["pairs_limit"])
+            _ensure_col("hard_close_minute", "hard_close_minute INTEGER NOT NULL DEFAULT 55", DEFAULT_SETTINGS["hard_close_minute"])
+            _ensure_col("revolutx_base_url", "revolutx_base_url TEXT NOT NULL DEFAULT ''", DEFAULT_SETTINGS["revolutx_base_url"])
+            _ensure_col("revolutx_base_path", "revolutx_base_path TEXT NOT NULL DEFAULT ''", DEFAULT_SETTINGS["revolutx_base_path"])
             row2 = conn.execute("SELECT id FROM onboarding WHERE id=1").fetchone()
             if row2 is None:
                 conn.execute(
@@ -123,7 +141,17 @@ class Storage:
             return dict(row)
 
     def update_settings(self, **kwargs) -> None:
-        allowed = {"base_currency", "starting_capital", "risk_mode", "paused"}
+        allowed = {
+            "base_currency",
+            "starting_capital",
+            "risk_mode",
+            "paused",
+            "scan_interval_seconds",
+            "pairs_limit",
+            "hard_close_minute",
+            "revolutx_base_url",
+            "revolutx_base_path",
+        }
         fields = [(k, v) for k, v in kwargs.items() if k in allowed]
         if not fields:
             return
@@ -140,7 +168,9 @@ class Storage:
             conn.execute(
                 """
                 UPDATE settings
-                SET base_currency=?, starting_capital=?, risk_mode=?, paused=?
+                SET base_currency=?, starting_capital=?, risk_mode=?, paused=?,
+                    scan_interval_seconds=?, pairs_limit=?, hard_close_minute=?,
+                    revolutx_base_url=?, revolutx_base_path=?
                 WHERE id=1
                 """,
                 (
@@ -148,6 +178,11 @@ class Storage:
                     DEFAULT_SETTINGS["starting_capital"],
                     DEFAULT_SETTINGS["risk_mode"],
                     DEFAULT_SETTINGS["paused"],
+                    DEFAULT_SETTINGS["scan_interval_seconds"],
+                    DEFAULT_SETTINGS["pairs_limit"],
+                    DEFAULT_SETTINGS["hard_close_minute"],
+                    DEFAULT_SETTINGS["revolutx_base_url"],
+                    DEFAULT_SETTINGS["revolutx_base_path"],
                 ),
             )
 

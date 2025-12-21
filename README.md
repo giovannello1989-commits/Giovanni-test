@@ -46,6 +46,10 @@ Consigliate:
 - `SIGNAL_COOLDOWN_SECONDS` (default `1800`)
 - `HARD_CLOSE_MINUTE` (default `55`, quindi 19:55)
 - `DB_PATH` (default `bot.db`)
+- `ENABLE_WEB_SETUP` (default `0`) → se `1` avvia il wizard web
+- `SETUP_ADMIN_TOKEN` (obbligatorio se `ENABLE_WEB_SETUP=1`) → token admin per proteggere la pagina
+- `WEB_PORT` (default `8080`, su alcuni provider usa `PORT`)
+- `WEB_HOST` (default `0.0.0.0`)
 
 ## Endpoints Revolut X (IMPORTANTE)
 
@@ -102,6 +106,23 @@ docker run --rm \
 - **Build command**: `pip install -r requirements.txt`
 - **Start command**: `python -m bot.main`
 - **Env vars**: inserisci quelle sopra
+
+## Wizard Web (frontend + server)
+
+Se vuoi configurare tutto da browser (senza comandi), abilita il wizard web:
+
+ENV:
+
+- `ENABLE_WEB_SETUP=1`
+- `SETUP_ADMIN_TOKEN=<una stringa lunga e segreta>`
+
+Poi apri (sul dominio del tuo servizio):
+
+- `/setup?token=<SETUP_ADMIN_TOKEN>`
+
+Nota:
+
+- I segreti **non** si inseriscono nella pagina: `TELEGRAM_BOT_TOKEN` e (se serve) `REVOLUTX_API_KEY` restano solo ENV.
 
 ## Come ottenere `TELEGRAM_ALLOWED_CHAT_ID` in 30 secondi
 

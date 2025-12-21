@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
+import threading
 from datetime import datetime, timezone
 from typing import Any
 
@@ -20,6 +22,7 @@ from bot.config import RISK_PROFILES, AppConfig, is_within_operating_window, loa
 from bot.revolutx import RevolutXClient
 from bot.storage import Storage
 from bot.strategy import compute_momentum_from_5m_candles, fmt_pct
+from bot.web import create_web_app
 
 
 logging.basicConfig(
@@ -120,13 +123,13 @@ async def cmd_config(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         f"- risk: `{risk.name}`\n"
         f"- base_currency: `{st['base_currency']}`\n"
         f"- starting_capital: `{st['starting_capital']}`\n"
-        f"- scan_interval_seconds: `{cfg.scan_interval_seconds}`\n"
-        f"- pairs_limit: `{cfg.pairs_limit}`\n"
+        f"- scan_interval_seconds: `{st.get('scan_interval_seconds', cfg.scan_interval_seconds)}`\n"
+        f"- pairs_limit: `{st.get('pairs_limit', cfg.pairs_limit)}`\n"
         f"- signal_cooldown_seconds: `{cfg.signal_cooldown_seconds}`\n"
         f"- window: `09:00–20:00 {cfg.tz_name}`\n"
-        f"- hard_close: `19:{cfg.hard_close_time.minute:02d}`\n"
-        f"- revolutx_base_url: `{cfg.revolutx_base_url}`\n"
-        f"- revolutx_base_path: `{cfg.revolutx_base_path}`\n"
+        f"- hard_close: `19:{st.get('hard_close_minute', cfg.hard_close_time.minute):02d}`\n"
+        f"- revolutx_base_url: `{st.get('revolutx_base_url') or cfg.revolutx_base_url}`\n"
+        f"- revolutx_base_path: `{st.get('revolutx_base_path') or cfg.revolutx_base_path}`\n"
         "\n"
         "_Nota: se Revolut X cambia path, aggiorna REVOLUTX_BASE_URL/REVOLUTX_BASE_PATH e i path in bot/revolutx.py._\n"
     )
@@ -624,13 +627,25 @@ async def scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     risk = RISK_PROFILES.get(st["risk_mode"], RISK_PROFILES["aggressive"])
+    # Allow base url/path overrides from DB (non-secrets)
+    base_url = st.get("revolutx_base_url") or cfg.revolutx_base_url
+    base_path = st.get("revolutx_base_path") or cfg.revolutx_base_path
     client: RevolutXClient = context.application.bot_data["rx"]
+    if client.base_url != base_url.rstrip("/") or client.base_path.strip() != (base_path or "").strip():
+        client = RevolutXClient(
+            base_url=base_url,
+            base_path=base_path,
+            api_key=cfg.revolutx_api_key,
+            timeout_seconds=cfg.revolutx_timeout_seconds,
+        )
+        context.application.bot_data["rx"] = client
 
     # Load pairs (read-only). If endpoint mismatch, it'll return [] and we just skip.
     pairs = await asyncio.to_thread(client.get_pairs)
     if not pairs:
         return
-    pairs = pairs[: cfg.pairs_limit]
+    pairs_limit = int(st.get("pairs_limit", cfg.pairs_limit))
+    pairs = pairs[:pairs_limit]
 
     last_signal_by_symbol: dict[str, float] = context.application.bot_data.setdefault("last_signal_by_symbol", {})
     last_mom15_sign: dict[str, int] = context.application.bot_data.setdefault("last_mom15_sign", {})
@@ -720,9 +735,11 @@ async def hard_close_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     positions = await asyncio.to_thread(store.list_positions)
     if not positions:
         return
+    st = await asyncio.to_thread(store.get_settings)
+    hard_min = int(st.get("hard_close_minute", cfg.hard_close_time.minute))
     text = (
         "*CHIUDI TUTTO ORA*\n"
-        f"Sono le 19:{cfg.hard_close_time.minute:02d} ({cfg.tz_name}). Hai posizioni aperte:\n"
+        f"Sono le 19:{hard_min:02d} ({cfg.tz_name}). Hai posizioni aperte:\n"
         + "\n".join([f"- `{p.symbol}` qty≈{p.qty:.8g}" for p in positions])
         + "\n\n_Il bot non può chiudere: chiudi manualmente entro le 20:00._"
     )
@@ -784,9 +801,13 @@ async def recap_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 def build_app(cfg: AppConfig) -> Application:
     store = Storage(cfg.db_path)
+    # Bootstrap RevolutX base url/path from settings if present (non-secrets)
+    st = store.get_settings()
+    base_url = st.get("revolutx_base_url") or cfg.revolutx_base_url
+    base_path = st.get("revolutx_base_path") or cfg.revolutx_base_path
     rx = RevolutXClient(
-        base_url=cfg.revolutx_base_url,
-        base_path=cfg.revolutx_base_path,
+        base_url=base_url,
+        base_path=base_path,
         api_key=cfg.revolutx_api_key,
         timeout_seconds=cfg.revolutx_timeout_seconds,
     )
@@ -815,8 +836,11 @@ def build_app(cfg: AppConfig) -> Application:
 
     # Scheduling
     jq = app.job_queue
-    jq.run_repeating(scan_job, interval=cfg.scan_interval_seconds, first=5, name="scan")
-    jq.run_daily(hard_close_job, time=cfg.hard_close_time, name="hard_close")
+    scan_interval = int(st.get("scan_interval_seconds", cfg.scan_interval_seconds))
+    hard_min = int(st.get("hard_close_minute", cfg.hard_close_time.minute))
+    hard_close_time = cfg.hard_close_time.replace(minute=hard_min)
+    jq.run_repeating(scan_job, interval=scan_interval, first=5, name="scan")
+    jq.run_daily(hard_close_job, time=hard_close_time, name="hard_close")
     jq.run_daily(recap_job, time=cfg.recap_time, name="recap")
 
     return app
@@ -826,6 +850,23 @@ def main() -> None:
     cfg = load_config()
     app = build_app(cfg)
     logger.info("Bot starting. TZ=%s window=09:00-20:00 allowed_chat_id=%s", cfg.tz_name, cfg.telegram_allowed_chat_id)
+
+    # Optional web setup wizard (frontend + server)
+    if os.getenv("ENABLE_WEB_SETUP", "0") == "1":
+        store: Storage = app.bot_data["store"]
+
+        def _run_web():
+            import uvicorn
+
+            web_port = int(os.getenv("PORT") or os.getenv("WEB_PORT") or "8080")
+            web_host = os.getenv("WEB_HOST", "0.0.0.0")
+            web_app = create_web_app(store)
+            uvicorn.run(web_app, host=web_host, port=web_port, log_level="info")
+
+        t = threading.Thread(target=_run_web, daemon=True)
+        t.start()
+        logger.info("Web setup enabled on port=%s (set SETUP_ADMIN_TOKEN).", os.getenv("PORT") or os.getenv("WEB_PORT") or "8080")
+
     app.run_polling(close_loop=False, allowed_updates=Update.ALL_TYPES)
 
 

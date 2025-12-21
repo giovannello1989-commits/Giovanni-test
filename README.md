@@ -32,7 +32,7 @@ Bot Telegram in Python che **NON esegue trading**: legge (read-only) dati da Rev
 Obbligatorie:
 
 - `TELEGRAM_BOT_TOKEN`
-- `TELEGRAM_ALLOWED_CHAT_ID` (numero, es. `123456789`)
+- `TELEGRAM_ALLOWED_CHAT_ID` (opzionale: se mancante, il primo `/start` diventa owner e viene salvato nel DB)
 
 Consigliate:
 

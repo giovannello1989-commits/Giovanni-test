@@ -57,7 +57,23 @@ SETUP_STEP_CONFIRM = "confirm"
 
 def _authorized(cfg: AppConfig, update: Update) -> bool:
     chat = update.effective_chat
-    return bool(chat and chat.id == cfg.telegram_allowed_chat_id)
+    # If allowed chat id is not configured, authorization is handled by onboarding
+    # (first /start becomes owner).
+    if not chat:
+        return False
+    if cfg.telegram_allowed_chat_id is None:
+        return True
+    return chat.id == cfg.telegram_allowed_chat_id
+
+
+async def _get_owner_chat_id(context: ContextTypes.DEFAULT_TYPE) -> int | None:
+    cfg: AppConfig = context.application.bot_data["cfg"]
+    if cfg.telegram_allowed_chat_id is not None:
+        return cfg.telegram_allowed_chat_id
+    store: Storage = context.application.bot_data["store"]
+    st = await asyncio.to_thread(store.get_settings)
+    v = st.get("owner_chat_id")
+    return int(v) if v is not None else None
 
 
 def _money(x: float, cur: str) -> str:
@@ -77,6 +93,20 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     store: Storage = context.application.bot_data["store"]
+    # If TELEGRAM_ALLOWED_CHAT_ID is not set, bind first /start chat as owner.
+    if cfg.telegram_allowed_chat_id is None:
+        owner = await _get_owner_chat_id(context)
+        chat = update.effective_chat
+        if owner is None and chat:
+            await asyncio.to_thread(store.update_settings, owner_chat_id=chat.id)
+            owner = chat.id
+            await update.message.reply_text(
+                f"✅ Registrazione completata. Questa chat è ora l’owner (chat_id={owner})."
+            )
+        # If someone else writes later, block.
+        if owner is not None and chat and chat.id != owner:
+            return
+
     st = await asyncio.to_thread(store.get_settings)
     risk = RISK_PROFILES.get(st["risk_mode"], RISK_PROFILES["aggressive"])
 
@@ -114,6 +144,10 @@ async def cmd_config(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     cfg: AppConfig = context.application.bot_data["cfg"]
     if not _authorized(cfg, update):
         return
+    owner = await _get_owner_chat_id(context)
+    chat = update.effective_chat
+    if owner is not None and chat and chat.id != owner:
+        return
     store: Storage = context.application.bot_data["store"]
     st = await asyncio.to_thread(store.get_settings)
     risk = RISK_PROFILES.get(st["risk_mode"], RISK_PROFILES["aggressive"])
@@ -140,6 +174,10 @@ async def cmd_pause(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     cfg: AppConfig = context.application.bot_data["cfg"]
     if not _authorized(cfg, update):
         return
+    owner = await _get_owner_chat_id(context)
+    chat = update.effective_chat
+    if owner is not None and chat and chat.id != owner:
+        return
     store: Storage = context.application.bot_data["store"]
     await asyncio.to_thread(store.update_settings, paused=1)
     await update.message.reply_text("Scansione segnali: *PAUSA*.", parse_mode=ParseMode.MARKDOWN)
@@ -149,6 +187,10 @@ async def cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     cfg: AppConfig = context.application.bot_data["cfg"]
     if not _authorized(cfg, update):
         return
+    owner = await _get_owner_chat_id(context)
+    chat = update.effective_chat
+    if owner is not None and chat and chat.id != owner:
+        return
     store: Storage = context.application.bot_data["store"]
     await asyncio.to_thread(store.update_settings, paused=0)
     await update.message.reply_text("Scansione segnali: *ATTIVA*.", parse_mode=ParseMode.MARKDOWN)
@@ -157,6 +199,10 @@ async def cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 async def cmd_setcapital(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     cfg: AppConfig = context.application.bot_data["cfg"]
     if not _authorized(cfg, update):
+        return
+    owner = await _get_owner_chat_id(context)
+    chat = update.effective_chat
+    if owner is not None and chat and chat.id != owner:
         return
     if not context.args or len(context.args) < 2:
         await update.message.reply_text("Uso: `/setcapital 100 EUR`", parse_mode=ParseMode.MARKDOWN)
@@ -174,6 +220,10 @@ async def cmd_setcapital(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 async def cmd_setrisk(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     cfg: AppConfig = context.application.bot_data["cfg"]
     if not _authorized(cfg, update):
+        return
+    owner = await _get_owner_chat_id(context)
+    chat = update.effective_chat
+    if owner is not None and chat and chat.id != owner:
         return
     if not context.args:
         await update.message.reply_text("Uso: `/setrisk aggressive|normal|conservative`", parse_mode=ParseMode.MARKDOWN)
@@ -216,6 +266,10 @@ async def cmd_buy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     cfg: AppConfig = context.application.bot_data["cfg"]
     if not _authorized(cfg, update):
         return
+    owner = await _get_owner_chat_id(context)
+    chat = update.effective_chat
+    if owner is not None and chat and chat.id != owner:
+        return
     parsed = _parse_trade_cmd(context.args)
     if not parsed:
         await update.message.reply_text("Uso: `/buy BTC-EUR 20 at 43000`", parse_mode=ParseMode.MARKDOWN)
@@ -233,6 +287,10 @@ async def cmd_buy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_sell(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     cfg: AppConfig = context.application.bot_data["cfg"]
     if not _authorized(cfg, update):
+        return
+    owner = await _get_owner_chat_id(context)
+    chat = update.effective_chat
+    if owner is not None and chat and chat.id != owner:
         return
     parsed = _parse_trade_cmd(context.args)
     if not parsed:
@@ -252,6 +310,10 @@ async def cmd_sell(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_portfolio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     cfg: AppConfig = context.application.bot_data["cfg"]
     if not _authorized(cfg, update):
+        return
+    owner = await _get_owner_chat_id(context)
+    chat = update.effective_chat
+    if owner is not None and chat and chat.id != owner:
         return
 
     store: Storage = context.application.bot_data["store"]
@@ -283,6 +345,10 @@ async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     cfg: AppConfig = context.application.bot_data["cfg"]
     if not _authorized(cfg, update):
         return
+    owner = await _get_owner_chat_id(context)
+    chat = update.effective_chat
+    if owner is not None and chat and chat.id != owner:
+        return
     kb = InlineKeyboardMarkup(
         [
             [
@@ -300,6 +366,10 @@ async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def on_reset_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     cfg: AppConfig = context.application.bot_data["cfg"]
     if not _authorized(cfg, update):
+        return
+    owner = await _get_owner_chat_id(context)
+    chat = update.effective_chat
+    if owner is not None and chat and chat.id != owner:
         return
     q = update.callback_query
     if not q:
@@ -385,6 +455,10 @@ async def cmd_setup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     cfg: AppConfig = context.application.bot_data["cfg"]
     if not _authorized(cfg, update):
         return
+    owner = await _get_owner_chat_id(context)
+    chat = update.effective_chat
+    if owner is not None and chat and chat.id != owner:
+        return
     store: Storage = context.application.bot_data["store"]
     await asyncio.to_thread(store.set_onboarding, SETUP_STEP_BASE, {})
     await update.message.reply_text(
@@ -457,6 +531,10 @@ async def _setup_advance_prompt(context: ContextTypes.DEFAULT_TYPE, step: str) -
 async def on_setup_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     cfg: AppConfig = context.application.bot_data["cfg"]
     if not _authorized(cfg, update):
+        return
+    owner = await _get_owner_chat_id(context)
+    chat = update.effective_chat
+    if owner is not None and chat and chat.id != owner:
         return
     q = update.callback_query
     if not q:
@@ -557,6 +635,10 @@ async def on_setup_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 async def on_setup_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     cfg: AppConfig = context.application.bot_data["cfg"]
     if not _authorized(cfg, update):
+        return
+    owner = await _get_owner_chat_id(context)
+    chat = update.effective_chat
+    if owner is not None and chat and chat.id != owner:
         return
     if not update.message or not update.message.text:
         return
@@ -671,7 +753,7 @@ async def scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                     "_È un segnale quantitativo (non certezza). Usa stop aggressivi e ricorda: chiudi entro le 20:00._"
                 )
                 await context.application.bot.send_message(
-                    chat_id=cfg.telegram_allowed_chat_id,
+                    chat_id=(await _get_owner_chat_id(context)) or 0,
                     text=text,
                     parse_mode=ParseMode.MARKDOWN,
                 )
@@ -697,7 +779,7 @@ async def scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         # Trailing stop alert
         if last_price <= peak * (1.0 - risk.trailing_stop_pct):
             await context.application.bot.send_message(
-                chat_id=cfg.telegram_allowed_chat_id,
+                chat_id=(await _get_owner_chat_id(context)) or 0,
                 text=(
                     "*EXIT ALERT (trailing stop)*\n"
                     f"- symbol: `{p.symbol}`\n"
@@ -718,7 +800,7 @@ async def scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             last_mom15_sign[p.symbol] = cur
             if prev > 0 and cur < 0:
                 await context.application.bot.send_message(
-                    chat_id=cfg.telegram_allowed_chat_id,
+                    chat_id=(await _get_owner_chat_id(context)) or 0,
                     text=(
                         "*EXIT ALERT (reversal 15m)*\n"
                         f"- symbol: `{p.symbol}`\n"
@@ -743,7 +825,10 @@ async def hard_close_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         + "\n".join([f"- `{p.symbol}` qty≈{p.qty:.8g}" for p in positions])
         + "\n\n_Il bot non può chiudere: chiudi manualmente entro le 20:00._"
     )
-    await context.application.bot.send_message(chat_id=cfg.telegram_allowed_chat_id, text=text, parse_mode=ParseMode.MARKDOWN)
+    owner = await _get_owner_chat_id(context)
+    if owner is None:
+        return
+    await context.application.bot.send_message(chat_id=owner, text=text, parse_mode=ParseMode.MARKDOWN)
 
 
 async def recap_job(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -780,8 +865,11 @@ async def recap_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         "\n_Note: il non realizzato è uno snapshot a fine giornata (dipende dall’ultimo prezzo disponibile)._"
     )
 
+    owner = await _get_owner_chat_id(context)
+    if owner is None:
+        return
     await context.application.bot.send_message(
-        chat_id=cfg.telegram_allowed_chat_id,
+        chat_id=owner,
         text=recap,
         parse_mode=ParseMode.MARKDOWN,
     )
@@ -789,7 +877,7 @@ async def recap_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     positions = await asyncio.to_thread(store.list_positions)
     if positions:
         await context.application.bot.send_message(
-            chat_id=cfg.telegram_allowed_chat_id,
+            chat_id=owner,
             text=(
                 "*EMERGENZA: posizioni ancora aperte alle 20:00*\n"
                 + "\n".join([f"- `{p.symbol}` qty≈{p.qty:.8g}" for p in positions])

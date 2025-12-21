@@ -18,6 +18,7 @@ DEFAULT_SETTINGS = {
     "hard_close_minute": 55,
     "revolutx_base_url": "",
     "revolutx_base_path": "",
+    "owner_chat_id": None,
 }
 
 
@@ -127,6 +128,9 @@ class Storage:
             _ensure_col("hard_close_minute", "hard_close_minute INTEGER NOT NULL DEFAULT 55", DEFAULT_SETTINGS["hard_close_minute"])
             _ensure_col("revolutx_base_url", "revolutx_base_url TEXT NOT NULL DEFAULT ''", DEFAULT_SETTINGS["revolutx_base_url"])
             _ensure_col("revolutx_base_path", "revolutx_base_path TEXT NOT NULL DEFAULT ''", DEFAULT_SETTINGS["revolutx_base_path"])
+            # Nullable owner chat id (single-user binding)
+            if "owner_chat_id" not in cols:
+                conn.execute("ALTER TABLE settings ADD COLUMN owner_chat_id INTEGER")
             row2 = conn.execute("SELECT id FROM onboarding WHERE id=1").fetchone()
             if row2 is None:
                 conn.execute(
@@ -151,6 +155,7 @@ class Storage:
             "hard_close_minute",
             "revolutx_base_url",
             "revolutx_base_path",
+            "owner_chat_id",
         }
         fields = [(k, v) for k, v in kwargs.items() if k in allowed]
         if not fields:
@@ -170,7 +175,8 @@ class Storage:
                 UPDATE settings
                 SET base_currency=?, starting_capital=?, risk_mode=?, paused=?,
                     scan_interval_seconds=?, pairs_limit=?, hard_close_minute=?,
-                    revolutx_base_url=?, revolutx_base_path=?
+                    revolutx_base_url=?, revolutx_base_path=?,
+                    owner_chat_id=NULL
                 WHERE id=1
                 """,
                 (

@@ -7,14 +7,19 @@ from zoneinfo import ZoneInfo
 
 
 def _env(name: str, default: str | None = None) -> str | None:
+    # Env vars are case-sensitive on Linux, but some UIs may create keys with
+    # unexpected casing (e.g. Telegram_bot_token). Be forgiving: resolve keys
+    # case-insensitively.
     val = os.getenv(name)
-    if val is None or val == "":
-        # Railway/users sometimes set vars in lowercase by mistake.
-        # Be forgiving and also check lowercase version.
-        val = os.getenv(name.lower())
-        if val is None or val == "":
-            return default
-    return val
+    if val is not None and val != "":
+        return val
+
+    target = name.lower()
+    for k, v in os.environ.items():
+        if k.lower() == target and v != "":
+            return v
+
+    return default
 
 
 def _env_int(name: str, default: int) -> int:

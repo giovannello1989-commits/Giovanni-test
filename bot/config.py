@@ -27,6 +27,15 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _present_env_keys(prefix: str) -> list[str]:
+    p = prefix.lower()
+    keys = []
+    for k in os.environ.keys():
+        if k.lower().startswith(p):
+            keys.append(k)
+    return sorted(keys)
+
+
 @dataclass(frozen=True)
 class RiskProfile:
     name: str
@@ -89,9 +98,17 @@ def load_config() -> AppConfig:
     token = _env("TELEGRAM_BOT_TOKEN")
     allowed_chat_id = _env("TELEGRAM_ALLOWED_CHAT_ID")
     if not token:
-        raise RuntimeError("Missing TELEGRAM_BOT_TOKEN env var.")
+        keys = _present_env_keys("TELEGRAM_")
+        raise RuntimeError(
+            "Missing TELEGRAM_BOT_TOKEN env var. "
+            f"Env keys seen with prefix TELEGRAM_: {keys}"
+        )
     if not allowed_chat_id:
-        raise RuntimeError("Missing TELEGRAM_ALLOWED_CHAT_ID env var.")
+        keys = _present_env_keys("TELEGRAM_")
+        raise RuntimeError(
+            "Missing TELEGRAM_ALLOWED_CHAT_ID env var. "
+            f"Env keys seen with prefix TELEGRAM_: {keys}"
+        )
 
     tz_name = _env("TZ", "Europe/Rome") or "Europe/Rome"
     tz = ZoneInfo(tz_name)

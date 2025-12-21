@@ -847,6 +847,28 @@ def build_app(cfg: AppConfig) -> Application:
 
 
 def main() -> None:
+    # If Telegram token is missing but web setup is enabled, keep the service alive
+    # and expose a small page that tells what is missing.
+    if os.getenv("ENABLE_WEB_SETUP", "0") == "1" and not (os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("telegram_bot_token")):
+        import uvicorn
+        from fastapi import FastAPI
+        from fastapi.responses import HTMLResponse
+
+        app_web = FastAPI(docs_url=None, redoc_url=None)
+
+        @app_web.get("/", response_class=HTMLResponse)
+        async def _missing():
+            return HTMLResponse(
+                "<h2>Bot non avviato: manca TELEGRAM_BOT_TOKEN</h2>"
+                "<p>Imposta su Railway (Variables) <code>TELEGRAM_BOT_TOKEN</code> e fai Redeploy.</p>"
+            )
+
+        web_port = int(os.getenv("PORT") or os.getenv("WEB_PORT") or "8080")
+        web_host = os.getenv("WEB_HOST", "0.0.0.0")
+        logger.error("Missing TELEGRAM_BOT_TOKEN. Starting web-only helper on port=%s.", web_port)
+        uvicorn.run(app_web, host=web_host, port=web_port, log_level="info")
+        return
+
     cfg = load_config()
     app = build_app(cfg)
     logger.info("Bot starting. TZ=%s window=09:00-20:00 allowed_chat_id=%s", cfg.tz_name, cfg.telegram_allowed_chat_id)

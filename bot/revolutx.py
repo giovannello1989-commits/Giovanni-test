@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+import json
 import logging
 import time
 from dataclasses import dataclass
@@ -7,6 +9,8 @@ from typing import Any
 from urllib.parse import urljoin
 
 import requests
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 
 logger = logging.getLogger(__name__)
@@ -25,16 +29,20 @@ class RevolutXEndpoints:
     Then adjust these relative paths if the doc differs.
     """
 
-    # Examples / placeholders — update to match official docs.
-    pairs: str = "/public/pairs"
-    candles: str = "/public/candles"
-    ticker: str = "/public/ticker"
-    balances: str = "/private/balances"
-    private_trades: str = "/private/trades"
+    # IMPORTANT:
+    # These are placeholders. In the official Revolut X REST API, paths usually start from /api
+    # (example from docs: /api/1.0/orders).
+    #
+    # Keep these centralized so you can update them quickly.
+    pairs: str = "/api/1.0/pairs"
+    candles: str = "/api/1.0/candles"
+    ticker: str = "/api/1.0/ticker"
+    balances: str = "/api/1.0/balances"
+    private_trades: str = "/api/1.0/trades"
     # Trading (write) endpoints (placeholders — MUST match official docs)
-    place_order: str = "/private/orders"
-    cancel_order: str = "/private/orders/cancel"
-    order_status: str = "/private/orders"
+    place_order: str = "/api/1.0/orders"
+    cancel_order: str = "/api/1.0/orders/cancel"
+    order_status: str = "/api/1.0/orders"
 
 
 class RevolutXClient:
@@ -43,23 +51,84 @@ class RevolutXClient:
         base_url: str,
         base_path: str,
         api_key: str | None = None,
+        private_key_pem: str | None = None,
         timeout_seconds: int = 10,
         endpoints: RevolutXEndpoints | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.base_path = (base_path or "").strip()
         self.api_key = api_key
+        self.private_key_pem = private_key_pem
         self.timeout_seconds = timeout_seconds
         self.endpoints = endpoints or RevolutXEndpoints()
 
         self.session = requests.Session()
 
+    def _load_private_key(self) -> Ed25519PrivateKey | None:
+        if not self.private_key_pem:
+            return None
+        try:
+            key = serialization.load_pem_private_key(
+                self.private_key_pem.encode("utf-8"),
+                password=None,
+            )
+            if isinstance(key, Ed25519PrivateKey):
+                return key
+        except Exception as e:
+            logger.warning("Failed to load Revolut X private key PEM: %s", repr(e))
+        return None
+
+    @staticmethod
+    def _minified_json(obj: Any) -> str:
+        return json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
+
+    @staticmethod
+    def _sorted_query_string(params: dict[str, Any] | None) -> str:
+        if not params:
+            return ""
+        # Deterministic order is important for signatures.
+        items = []
+        for k in sorted(params.keys()):
+            v = params[k]
+            if v is None:
+                continue
+            items.append(f"{k}={v}")
+        return "&".join(items)
+
+    def _sign_headers(
+        self,
+        method: str,
+        request_path: str,
+        query_string: str,
+        body_json_minified: str,
+    ) -> dict[str, str]:
+        """
+        Revolut X signature scheme (from docs):
+          message = timestamp_ms + METHOD + PATH + QUERY + BODY
+          signature = base64( sign_ed25519(private_key, message) )
+          headers:
+            X-Revx-API-Key
+            X-Revx-Timestamp
+            X-Revx-Signature
+        """
+        if not self.api_key:
+            return {}
+        pk = self._load_private_key()
+        if not pk:
+            return {}
+        ts_ms = str(int(time.time() * 1000))
+        msg = f"{ts_ms}{method.upper()}{request_path}{query_string}{body_json_minified}"
+        sig = pk.sign(msg.encode("utf-8"))
+        sig_b64 = base64.b64encode(sig).decode("ascii")
+        return {
+            "X-Revx-API-Key": self.api_key,
+            "X-Revx-Timestamp": ts_ms,
+            "X-Revx-Signature": sig_b64,
+        }
+
     def _headers(self) -> dict[str, str]:
-        headers: dict[str, str] = {"Accept": "application/json"}
-        if self.api_key:
-            # Placeholder: adjust header name as per official Revolut X docs.
-            headers["Authorization"] = f"Bearer {self.api_key}"
-        return headers
+        # Base headers. Auth/signature headers are added per request in _request_json.
+        return {"Accept": "application/json"}
 
     def _make_url(self, relative_path: str) -> str:
         # base_url + base_path + relative_path (all normalized)
@@ -71,18 +140,28 @@ class RevolutXClient:
         method: str,
         relative_path: str,
         params: dict[str, Any] | None = None,
+        json_body: dict[str, Any] | None = None,
         retries: int = 2,
         backoff_seconds: float = 0.5,
     ) -> Any | None:
         url = self._make_url(relative_path)
+        request_path = ("/" + self.base_path.strip("/")) if self.base_path else ""
+        request_path = request_path + (relative_path if relative_path.startswith("/") else f"/{relative_path}")
+        query_string = self._sorted_query_string(params)
+        body_min = self._minified_json(json_body) if json_body is not None else ""
+        sig_headers = self._sign_headers(method, request_path, query_string, body_min)
         last_err: Exception | None = None
         for attempt in range(retries + 1):
             try:
+                headers = {**self._headers(), **sig_headers}
+                if json_body is not None:
+                    headers["Content-Type"] = "application/json"
                 resp = self.session.request(
                     method=method,
                     url=url,
                     params=params,
-                    headers=self._headers(),
+                    json=json_body,
+                    headers=headers,
                     timeout=self.timeout_seconds,
                 )
                 if resp.status_code >= 500:
@@ -263,12 +342,12 @@ class RevolutXClient:
         if client_order_id:
             payload["clientOrderId"] = client_order_id
 
-        # Using params for simplicity; if your API requires JSON body, switch to json=payload in request().
-        return self._request_json("POST", self.endpoints.place_order, params=payload)
+        # Revolut X signing requires the minified JSON body to be part of the signature.
+        return self._request_json("POST", self.endpoints.place_order, json_body=payload)
 
     def cancel_order(self, order_id: str) -> Any | None:
         payload = {"orderId": order_id}
-        return self._request_json("POST", self.endpoints.cancel_order, params=payload)
+        return self._request_json("POST", self.endpoints.cancel_order, json_body=payload)
 
     def get_order_status(self, order_id: str) -> Any | None:
         return self._request_json("GET", self.endpoints.order_status, params={"orderId": order_id})

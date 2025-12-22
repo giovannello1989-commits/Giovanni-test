@@ -50,6 +50,24 @@ Consigliate:
 - `STATUS_PING_ALWAYS` (default `0`) → se `1` manda lo status anche fuori 09:00–20:00
 - `MARKET_DATA_PROVIDER` (default `binance`) → fonte dati per segnali (no Revolut)
 - `MARKET_DATA_QUOTE` (default uguale a `base_currency`, es. `EUR`) → valuta quote per pairs (es. EUR o USDT)
+
+## Revolut X REST API (Ed25519)
+
+Dalla doc ufficiale Revolut X:
+
+- Genera chiavi Ed25519 con **openssl** e incolla la **public key PEM** su Revolut X (include `BEGIN/END`).
+- Conserva la **private key PEM** come secret sul provider.
+
+ENV (segreti):
+
+- `REVOLUTX_API_KEY` = stringa alfanumerica (64 char) fornita da Revolut X
+- `REVOLUTX_ED25519_PRIVATE_KEY_PEM` = contenuto completo di `private.pem` (inclusi `BEGIN/END`)
+
+Header auth richiesti (gestiti dal client):
+
+- `X-Revx-API-Key`
+- `X-Revx-Timestamp` (ms)
+- `X-Revx-Signature` (Ed25519 + base64)
 - `ENABLE_WEB_SETUP` (default `0`) → se `1` avvia il wizard web
 - `SETUP_ADMIN_TOKEN` (obbligatorio se `ENABLE_WEB_SETUP=1`) → token admin per proteggere la pagina
 - `WEB_PORT` (default `8080`, su alcuni provider usa `PORT`)

@@ -1204,6 +1204,7 @@ def build_app(cfg: AppConfig) -> Application:
         base_url=base_url,
         base_path=base_path,
         api_key=cfg.revolutx_api_key,
+        private_key_pem=os.getenv("REVOLUTX_ED25519_PRIVATE_KEY_PEM"),
         timeout_seconds=cfg.revolutx_timeout_seconds,
     )
 

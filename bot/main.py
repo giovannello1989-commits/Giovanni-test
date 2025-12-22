@@ -1033,7 +1033,14 @@ def build_app(cfg: AppConfig) -> Application:
     # Market data provider (default: Binance public, no key)
     md_provider = os.getenv("MARKET_DATA_PROVIDER", "binance")
     md_quote = os.getenv("MARKET_DATA_QUOTE", st.get("base_currency", "EUR")) or "EUR"
-    md = create_market_data_client(md_provider, quote=md_quote, timeout_seconds=cfg.revolutx_timeout_seconds)
+    md = create_market_data_client(
+        md_provider,
+        quote=md_quote,
+        timeout_seconds=cfg.revolutx_timeout_seconds,
+        revolutx_base_url=base_url,
+        revolutx_base_path=base_path,
+        revolutx_api_key=cfg.revolutx_api_key,
+    )
 
     app = Application.builder().token(cfg.telegram_bot_token).build()
     app.bot_data["cfg"] = cfg

@@ -135,12 +135,55 @@ class BinancePublicClient(MarketDataClient):
         return None
 
 
-def create_market_data_client(provider: str, quote: str, timeout_seconds: int = 10) -> MarketDataClient:
+class RevolutXMarketDataClient(MarketDataClient):
+    """
+    Adapter around RevolutXClient (read-only) to conform to MarketDataClient.
+    """
+
+    def __init__(self, base_url: str, base_path: str, api_key: str | None, timeout_seconds: int = 10) -> None:
+        # Local import to keep dependencies optional/clean.
+        from bot.revolutx import RevolutXClient
+
+        self.rx = RevolutXClient(
+            base_url=base_url,
+            base_path=base_path,
+            api_key=api_key,
+            timeout_seconds=timeout_seconds,
+        )
+
+    def get_pairs(self) -> list[str]:
+        return self.rx.get_pairs()
+
+    def get_candles(self, symbol: str, interval: str, limit: int) -> list[dict[str, Any]]:
+        # RevolutXClient has flexible signature; we pass limit and rely on its parsing.
+        return self.rx.get_candles(symbol=symbol, interval=interval, limit=limit)
+
+    def get_last_price(self, symbol: str) -> float | None:
+        return self.rx.get_last_price(symbol=symbol, interval_fallback="5m")
+
+
+def create_market_data_client(
+    provider: str,
+    quote: str,
+    timeout_seconds: int = 10,
+    revolutx_base_url: str | None = None,
+    revolutx_base_path: str | None = None,
+    revolutx_api_key: str | None = None,
+) -> MarketDataClient:
     provider = (provider or "binance").lower().strip()
     if provider == "binance":
         return BinancePublicClient(
             quote=quote,
             cfg=BinanceConfig(timeout_seconds=timeout_seconds),
+        )
+    if provider == "revolutx":
+        if not revolutx_base_url or revolutx_base_url.strip() == "":
+            raise ValueError("MARKET_DATA_PROVIDER=revolutx requires REVOLUTX_BASE_URL (or revolutx_base_url)")
+        return RevolutXMarketDataClient(
+            base_url=revolutx_base_url,
+            base_path=revolutx_base_path or "",
+            api_key=revolutx_api_key,
+            timeout_seconds=timeout_seconds,
         )
     raise ValueError(f"Unsupported MARKET_DATA_PROVIDER: {provider}")
 

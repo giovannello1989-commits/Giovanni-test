@@ -19,6 +19,15 @@ DEFAULT_SETTINGS = {
     "revolutx_base_url": "",
     "revolutx_base_path": "",
     "owner_chat_id": None,
+    # Operating mode: "session" (09-20) or "always" (24/7)
+    "mode": "session",
+    # Auto-trading (OFF by default)
+    "autotrade_enabled": 0,
+    # "paper" (simulated) or "live" (real orders)
+    "autotrade_mode": "paper",
+    # Hard cap in quote currency (e.g., 100 USDT)
+    "autotrade_max_quote": 100.0,
+    "autotrade_quote_currency": "USDT",
 }
 
 
@@ -32,6 +41,8 @@ class Trade:
     price: float
     qty: float
     realized_pnl: float | None
+    source: str | None
+    order_id: str | None
 
 
 @dataclass(frozen=True)
@@ -76,7 +87,9 @@ class Storage:
                     amount_base REAL NOT NULL,
                     price REAL NOT NULL,
                     qty REAL NOT NULL,
-                    realized_pnl REAL
+                    realized_pnl REAL,
+                    source TEXT,
+                    order_id TEXT
                 )
                 """
             )
@@ -131,6 +144,20 @@ class Storage:
             # Nullable owner chat id (single-user binding)
             if "owner_chat_id" not in cols:
                 conn.execute("ALTER TABLE settings ADD COLUMN owner_chat_id INTEGER")
+            # Autotrade / mode
+            cols = [r["name"] for r in conn.execute("PRAGMA table_info(settings)").fetchall()]
+            _ensure_col("mode", "mode TEXT NOT NULL DEFAULT 'session'", DEFAULT_SETTINGS["mode"])
+            _ensure_col("autotrade_enabled", "autotrade_enabled INTEGER NOT NULL DEFAULT 0", DEFAULT_SETTINGS["autotrade_enabled"])
+            _ensure_col("autotrade_mode", "autotrade_mode TEXT NOT NULL DEFAULT 'paper'", DEFAULT_SETTINGS["autotrade_mode"])
+            _ensure_col("autotrade_max_quote", "autotrade_max_quote REAL NOT NULL DEFAULT 100.0", DEFAULT_SETTINGS["autotrade_max_quote"])
+            _ensure_col("autotrade_quote_currency", "autotrade_quote_currency TEXT NOT NULL DEFAULT 'USDT'", DEFAULT_SETTINGS["autotrade_quote_currency"])
+
+            # Trades table migration for new columns
+            trade_cols = [r["name"] for r in conn.execute("PRAGMA table_info(trades)").fetchall()]
+            if "source" not in trade_cols:
+                conn.execute("ALTER TABLE trades ADD COLUMN source TEXT")
+            if "order_id" not in trade_cols:
+                conn.execute("ALTER TABLE trades ADD COLUMN order_id TEXT")
             row2 = conn.execute("SELECT id FROM onboarding WHERE id=1").fetchone()
             if row2 is None:
                 conn.execute(
@@ -156,6 +183,11 @@ class Storage:
             "revolutx_base_url",
             "revolutx_base_path",
             "owner_chat_id",
+            "mode",
+            "autotrade_enabled",
+            "autotrade_mode",
+            "autotrade_max_quote",
+            "autotrade_quote_currency",
         }
         fields = [(k, v) for k, v in kwargs.items() if k in allowed]
         if not fields:
@@ -176,7 +208,12 @@ class Storage:
                 SET base_currency=?, starting_capital=?, risk_mode=?, paused=?,
                     scan_interval_seconds=?, pairs_limit=?, hard_close_minute=?,
                     revolutx_base_url=?, revolutx_base_path=?,
-                    owner_chat_id=NULL
+                    owner_chat_id=NULL,
+                    mode=?,
+                    autotrade_enabled=?,
+                    autotrade_mode=?,
+                    autotrade_max_quote=?,
+                    autotrade_quote_currency=?
                 WHERE id=1
                 """,
                 (
@@ -189,6 +226,11 @@ class Storage:
                     DEFAULT_SETTINGS["hard_close_minute"],
                     DEFAULT_SETTINGS["revolutx_base_url"],
                     DEFAULT_SETTINGS["revolutx_base_path"],
+                    DEFAULT_SETTINGS["mode"],
+                    DEFAULT_SETTINGS["autotrade_enabled"],
+                    DEFAULT_SETTINGS["autotrade_mode"],
+                    DEFAULT_SETTINGS["autotrade_max_quote"],
+                    DEFAULT_SETTINGS["autotrade_quote_currency"],
                 ),
             )
 
@@ -222,17 +264,17 @@ class Storage:
     def _now_utc_iso(self) -> str:
         return datetime.now(timezone.utc).isoformat()
 
-    def add_buy(self, symbol: str, amount_base: float, price: float) -> None:
+    def add_buy(self, symbol: str, amount_base: float, price: float, source: str = "manual", order_id: str | None = None) -> None:
         symbol = symbol.upper()
         qty = amount_base / price
         ts_utc = self._now_utc_iso()
         with self._connect() as conn:
             conn.execute(
                 """
-                INSERT INTO trades (ts_utc, side, symbol, amount_base, price, qty, realized_pnl)
-                VALUES (?, 'BUY', ?, ?, ?, ?, NULL)
+                INSERT INTO trades (ts_utc, side, symbol, amount_base, price, qty, realized_pnl, source, order_id)
+                VALUES (?, 'BUY', ?, ?, ?, ?, NULL, ?, ?)
                 """,
-                (ts_utc, symbol, amount_base, price, qty),
+                (ts_utc, symbol, amount_base, price, qty, source, order_id),
             )
             pos = conn.execute("SELECT * FROM positions WHERE symbol=?", (symbol,)).fetchone()
             if pos is None:
@@ -258,7 +300,7 @@ class Storage:
                     (new_qty, new_avg, peak_price, symbol),
                 )
 
-    def add_sell(self, symbol: str, amount_base: float, price: float) -> float:
+    def add_sell(self, symbol: str, amount_base: float, price: float, source: str = "manual", order_id: str | None = None) -> float:
         """
         Returns realized PnL for this sell (base currency).
         If the position doesn't exist, PnL is computed vs 0 avg_entry (still recorded).
@@ -272,10 +314,10 @@ class Storage:
             realized = amount_base - (qty * avg_entry)
             conn.execute(
                 """
-                INSERT INTO trades (ts_utc, side, symbol, amount_base, price, qty, realized_pnl)
-                VALUES (?, 'SELL', ?, ?, ?, ?, ?)
+                INSERT INTO trades (ts_utc, side, symbol, amount_base, price, qty, realized_pnl, source, order_id)
+                VALUES (?, 'SELL', ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (ts_utc, symbol, amount_base, price, qty, realized),
+                (ts_utc, symbol, amount_base, price, qty, realized, source, order_id),
             )
 
             if pos is None:
@@ -339,6 +381,8 @@ class Storage:
                     price=float(r["price"]),
                     qty=float(r["qty"]),
                     realized_pnl=float(r["realized_pnl"]) if r["realized_pnl"] is not None else None,
+                    source=r["source"] if "source" in r.keys() else None,
+                    order_id=r["order_id"] if "order_id" in r.keys() else None,
                 )
                 for r in rows
             ]
@@ -356,6 +400,8 @@ class Storage:
                     price=float(r["price"]),
                     qty=float(r["qty"]),
                     realized_pnl=float(r["realized_pnl"]) if r["realized_pnl"] is not None else None,
+                    source=r["source"] if "source" in r.keys() else None,
+                    order_id=r["order_id"] if "order_id" in r.keys() else None,
                 )
                 for r in rows
             ]

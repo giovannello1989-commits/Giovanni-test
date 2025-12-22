@@ -31,6 +31,10 @@ class RevolutXEndpoints:
     ticker: str = "/public/ticker"
     balances: str = "/private/balances"
     private_trades: str = "/private/trades"
+    # Trading (write) endpoints (placeholders — MUST match official docs)
+    place_order: str = "/private/orders"
+    cancel_order: str = "/private/orders/cancel"
+    order_status: str = "/private/orders"
 
 
 class RevolutXClient:
@@ -228,4 +232,44 @@ class RevolutXClient:
     def get_private_trades(self, symbol: str | None = None) -> Any | None:
         params = {"symbol": symbol} if symbol else None
         return self._request_json("GET", self.endpoints.private_trades, params=params)
+
+    # --- Trading endpoints (ONLY if you enable trading and your key allows it) ---
+    def place_order(
+        self,
+        symbol: str,
+        side: str,
+        order_type: str = "MARKET",
+        quote_amount: float | None = None,
+        base_amount: float | None = None,
+        client_order_id: str | None = None,
+    ) -> Any | None:
+        """
+        IMPORTANT: This is a generic placeholder implementation.
+        You MUST adapt payload/fields to Revolut X official trading docs.
+
+        Many exchanges support either:
+        - quote amount (spend X USDT)
+        - base amount (buy X BTC)
+        """
+        payload: dict[str, Any] = {
+            "symbol": symbol,
+            "side": side.upper(),
+            "type": order_type.upper(),
+        }
+        if quote_amount is not None:
+            payload["quoteAmount"] = quote_amount
+        if base_amount is not None:
+            payload["baseAmount"] = base_amount
+        if client_order_id:
+            payload["clientOrderId"] = client_order_id
+
+        # Using params for simplicity; if your API requires JSON body, switch to json=payload in request().
+        return self._request_json("POST", self.endpoints.place_order, params=payload)
+
+    def cancel_order(self, order_id: str) -> Any | None:
+        payload = {"orderId": order_id}
+        return self._request_json("POST", self.endpoints.cancel_order, params=payload)
+
+    def get_order_status(self, order_id: str) -> Any | None:
+        return self._request_json("GET", self.endpoints.order_status, params={"orderId": order_id})
 

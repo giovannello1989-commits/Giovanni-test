@@ -32,6 +32,8 @@ DEFAULT_SETTINGS = {
     # Market data (signals)
     "market_data_provider": "binance",
     "market_data_quote": "USDT",
+    # Internal: if 0, /start will apply bootstrap defaults
+    "bootstrapped": 0,
 }
 
 
@@ -158,6 +160,7 @@ class Storage:
             _ensure_col("autotrade_max_positions", "autotrade_max_positions INTEGER NOT NULL DEFAULT 3", DEFAULT_SETTINGS["autotrade_max_positions"])
             _ensure_col("market_data_provider", "market_data_provider TEXT NOT NULL DEFAULT 'binance'", DEFAULT_SETTINGS["market_data_provider"])
             _ensure_col("market_data_quote", "market_data_quote TEXT NOT NULL DEFAULT 'USDT'", DEFAULT_SETTINGS["market_data_quote"])
+            _ensure_col("bootstrapped", "bootstrapped INTEGER NOT NULL DEFAULT 0", DEFAULT_SETTINGS["bootstrapped"])
 
             # Trades table migration for new columns
             trade_cols = [r["name"] for r in conn.execute("PRAGMA table_info(trades)").fetchall()]
@@ -198,6 +201,7 @@ class Storage:
             "autotrade_max_positions",
             "market_data_provider",
             "market_data_quote",
+            "bootstrapped",
         }
         fields = [(k, v) for k, v in kwargs.items() if k in allowed]
         if not fields:
@@ -226,7 +230,8 @@ class Storage:
                     autotrade_quote_currency=?,
                     autotrade_max_positions=?,
                     market_data_provider=?,
-                    market_data_quote=?
+                    market_data_quote=?,
+                    bootstrapped=?
                 WHERE id=1
                 """,
                 (
@@ -247,6 +252,7 @@ class Storage:
                     DEFAULT_SETTINGS["autotrade_max_positions"],
                     DEFAULT_SETTINGS["market_data_provider"],
                     DEFAULT_SETTINGS["market_data_quote"],
+                    DEFAULT_SETTINGS["bootstrapped"],
                 ),
             )
 

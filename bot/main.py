@@ -111,6 +111,21 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             return
 
     st = await asyncio.to_thread(store.get_settings)
+    # After /reset (bootstrapped=0), auto-apply defaults:
+    # - risk normal
+    # - autotrade on
+    # - 24/7 (always)
+    # - scanner active
+    if int(st.get("bootstrapped", 0)) == 0:
+        await asyncio.to_thread(
+            store.update_settings,
+            risk_mode="normal",
+            autotrade_enabled=1,
+            mode="always",
+            paused=0,
+            bootstrapped=1,
+        )
+        st = await asyncio.to_thread(store.get_settings)
     risk = RISK_PROFILES.get(st["risk_mode"], RISK_PROFILES["aggressive"])
 
     now = datetime.now(cfg.tz)

@@ -144,6 +144,26 @@ class RevolutXClient:
         retries: int = 2,
         backoff_seconds: float = 0.5,
     ) -> Any | None:
+        status, data = self._request(method, relative_path, params=params, json_body=json_body, retries=retries, backoff_seconds=backoff_seconds)
+        if status is None:
+            return None
+        if status >= 400:
+            return None
+        return data
+
+    def _request(
+        self,
+        method: str,
+        relative_path: str,
+        params: dict[str, Any] | None = None,
+        json_body: dict[str, Any] | None = None,
+        retries: int = 2,
+        backoff_seconds: float = 0.5,
+    ) -> tuple[int | None, Any | None]:
+        """
+        Low-level request that returns (status_code, parsed_json_or_text_or_none).
+        Used for debugging/probing endpoints.
+        """
         url = self._make_url(relative_path)
         request_path = ("/" + self.base_path.strip("/")) if self.base_path else ""
         request_path = request_path + (relative_path if relative_path.startswith("/") else f"/{relative_path}")
@@ -170,15 +190,38 @@ class RevolutXClient:
                     raise requests.HTTPError("Rate limited (429)", response=resp)
                 if resp.status_code >= 400:
                     logger.warning("Revolut X API error %s for %s: %s", resp.status_code, url, resp.text[:300])
-                    return None
-                return resp.json()
+                    # best-effort parse
+                    try:
+                        return resp.status_code, resp.json()
+                    except Exception:
+                        return resp.status_code, resp.text
+                try:
+                    return resp.status_code, resp.json()
+                except Exception:
+                    return resp.status_code, resp.text
             except Exception as e:
                 last_err = e
                 if attempt < retries:
                     time.sleep(backoff_seconds * (2**attempt))
                     continue
                 logger.warning("Revolut X request failed: %s %s (%s)", method, url, repr(last_err))
-                return None
+                return None, None
+
+    def probe(self, relative_paths: list[str]) -> list[dict[str, Any]]:
+        """
+        Probe a list of paths (GET) and return status codes.
+        """
+        results: list[dict[str, Any]] = []
+        for p in relative_paths:
+            status, data = self._request("GET", p, params=None, json_body=None, retries=0)
+            results.append(
+                {
+                    "path": p,
+                    "status": status,
+                    "sample": (str(data)[:140] if data is not None else None),
+                }
+            )
+        return results
 
     # --- Public API ---
     def get_pairs(self) -> list[str]:

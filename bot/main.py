@@ -245,6 +245,41 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     await update.message.reply_text(await _build_status_text(context))
 
 
+async def cmd_revxprobe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Probes common Revolut X REST API paths (read-only) to discover correct endpoints.
+    """
+    cfg: AppConfig = context.application.bot_data["cfg"]
+    if not _authorized(cfg, update):
+        return
+    owner = await _get_owner_chat_id(context)
+    chat = update.effective_chat
+    if owner is not None and chat and chat.id != owner:
+        return
+
+    rx: RevolutXClient = context.application.bot_data["rx"]
+    candidates = [
+        "/api/1.0/balances",
+        "/api/1.0/accounts",
+        "/api/1.0/pairs",
+        "/api/1.0/symbols",
+        "/api/1.0/instruments",
+        "/api/1.0/markets",
+        "/api/1.0/ticker",
+        "/api/1.0/tickers",
+        "/api/1.0/candles",
+        "/api/1.0/klines",
+        "/api/1.0/orders/active",
+        "/api/1.0/orders",
+        "/api/1.0/trades",
+    ]
+    results = await asyncio.to_thread(rx.probe, candidates)
+    lines = ["REVX PROBE (GET)"]
+    for r in results:
+        lines.append(f"- {r['path']}: {r['status']} {'' if not r['sample'] else str(r['sample'])[:60]}")
+    lines.append("\nSe vedi 200 su balances/pairs/candles, mi hai trovato gli endpoint corretti.")
+    await update.message.reply_text("\n".join(lines))
+
 async def cmd_setmode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     cfg: AppConfig = context.application.bot_data["cfg"]
     if not _authorized(cfg, update):
@@ -1263,6 +1298,7 @@ def build_app(cfg: AppConfig) -> Application:
     app.add_handler(CommandHandler("sell", cmd_sell))
     app.add_handler(CommandHandler("portfolio", cmd_portfolio))
     app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("revxprobe", cmd_revxprobe))
     app.add_handler(CommandHandler("setmode", cmd_setmode))
     app.add_handler(CommandHandler("autotrade", cmd_autotrade))
     app.add_handler(CommandHandler("reset", cmd_reset))

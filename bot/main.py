@@ -275,6 +275,7 @@ async def cmd_revxprobe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     ]
     results = await asyncio.to_thread(rx.probe, candidates)
     lines = ["REVX PROBE (GET)"]
+    lines.append(f"- auth_ready: {await asyncio.to_thread(rx.auth_ready)}")
     for r in results:
         lines.append(f"- {r['path']}: {r['status']} {'' if not r['sample'] else str(r['sample'])[:60]}")
     lines.append("\nSe vedi 200 su balances/pairs/candles, mi hai trovato gli endpoint corretti.")

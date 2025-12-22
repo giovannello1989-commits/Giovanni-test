@@ -78,6 +78,12 @@ class RevolutXClient:
             logger.warning("Failed to load Revolut X private key PEM: %s", repr(e))
         return None
 
+    def auth_ready(self) -> bool:
+        """
+        Returns True if we have both API key and a loadable Ed25519 private key.
+        """
+        return bool(self.api_key) and (self._load_private_key() is not None)
+
     @staticmethod
     def _minified_json(obj: Any) -> str:
         return json.dumps(obj, separators=(",", ":"), ensure_ascii=False)

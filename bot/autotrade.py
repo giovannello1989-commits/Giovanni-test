@@ -66,15 +66,20 @@ def decide_autobuy(
     - total open notional across quote currency <= quote_cap_total
     - buy with remaining budget (>= min_trade_quote)
     """
-    if any(p.symbol.upper() == symbol.upper() for p in store.list_positions()):
-        return AutoTradeDecision(action="SKIP", symbol=symbol, reason="position already open")
+    positions = store.list_positions()
+    if any(p.symbol.upper() == symbol.upper() for p in positions):
+        return AutoTradeDecision(action="SKIP", symbol=symbol, reason="position already open (same symbol)")
+
+    # Enforce single active position per quote currency (simple & safer).
+    if any(symbol_quote(p.symbol) == quote_currency.upper() for p in positions):
+        return AutoTradeDecision(action="SKIP", symbol=symbol, reason="another position already open (single-position mode)")
 
     open_notional = total_open_notional(store, quote_currency)
     remaining = max(0.0, float(quote_cap_total) - open_notional)
     if remaining < float(min_trade_quote):
         return AutoTradeDecision(action="SKIP", symbol=symbol, reason="cap reached / remaining too small")
 
-    return AutoTradeDecision(action="BUY", symbol=symbol, quote_amount=remaining, reason="buy with remaining budget")
+    return AutoTradeDecision(action="BUY", symbol=symbol, quote_amount=remaining, reason="buy (cap enforcement)")
 
 
 def decide_autosell_all(symbol: str, reason: str) -> AutoTradeDecision:

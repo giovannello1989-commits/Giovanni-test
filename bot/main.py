@@ -298,7 +298,10 @@ async def cmd_autotrade(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         if enabled == 1:
             # Force 24/7 as requested
             await asyncio.to_thread(store.update_settings, mode="always")
-        await update.message.reply_text(f"OK. autotrade_enabled={bool(enabled)} (mode={'always' if enabled else (await asyncio.to_thread(store.get_settings)).get('mode','session')}).")
+        st = await asyncio.to_thread(store.get_settings)
+        await update.message.reply_text(
+            f"OK. autotrade_enabled={bool(enabled)} (mode={st.get('mode','session')})."
+        )
         return
 
     if sub == "mode":
@@ -937,6 +940,15 @@ async def scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     last_signal_by_symbol: dict[str, float] = context.application.bot_data.setdefault("last_signal_by_symbol", {})
     last_mom15_sign: dict[str, int] = context.application.bot_data.setdefault("last_mom15_sign", {})
 
+    autotrade_on = int(st.get("autotrade_enabled", 0)) == 1
+    quote_cap = float(st.get("autotrade_max_quote", 100.0))
+    quote_cur = str(st.get("autotrade_quote_currency", "USDT")).upper()
+    exec_mode = str(st.get("autotrade_mode", "paper")).lower()
+    executor = live_exec if exec_mode == "live" else paper_exec
+
+    # Track best candidate this scan (so we open at most one position per scan).
+    best_candidate = None  # (symbol, sig)
+
     # Scan momentum for candidate BUY signals
     try:
         for symbol in pairs:
@@ -946,6 +958,11 @@ async def scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                 continue
 
             if sig.mom_1h >= risk.mom_1h_threshold and sig.mom_15m >= risk.mom_15m_threshold:
+                # Keep best candidate for auto-buy (highest 15m momentum)
+                if autotrade_on and symbol.endswith(f"-{quote_cur}"):
+                    if best_candidate is None or sig.mom_15m > best_candidate[1].mom_15m:
+                        best_candidate = (symbol, sig)
+
                 now_ts = now.timestamp()
                 last_ts = float(last_signal_by_symbol.get(symbol, 0.0))
                 if now_ts - last_ts >= cfg.signal_cooldown_seconds:
@@ -968,47 +985,6 @@ async def scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                         metrics["signals_sent"] = int(metrics.get("signals_sent", 0)) + 1
                         metrics["last_signal_ts"] = now_ts
 
-                # AUTO-TRADE (best effort): if enabled, try to buy with remaining budget up to cap.
-                if int(st.get("autotrade_enabled", 0)) == 1:
-                    quote_cap = float(st.get("autotrade_max_quote", 100.0))
-                    quote_cur = str(st.get("autotrade_quote_currency", "USDT")).upper()
-                    # Only trade symbols that match quote currency (e.g., *-USDT)
-                    if symbol.endswith(f"-{quote_cur}"):
-                        decision = decide_autobuy(
-                            store=store,
-                            symbol=symbol,
-                            quote_cap_total=quote_cap,
-                            quote_currency=quote_cur,
-                            min_trade_quote=10.0,
-                        )
-                        if decision.action == "BUY" and decision.quote_amount:
-                            exec_mode = str(st.get("autotrade_mode", "paper")).lower()
-                            ex = live_exec if exec_mode == "live" else paper_exec
-                            res = await asyncio.to_thread(ex.buy_quote, symbol, float(decision.quote_amount))
-                            owner = await _get_owner_chat_id(context)
-                            if owner is not None:
-                                if res.ok:
-                                    metrics["last_trade_action"] = f"BUY {symbol} {decision.quote_amount:.2f} {quote_cur} ({exec_mode})"
-                                    metrics["last_trade_ts"] = now.timestamp()
-                                    await context.application.bot.send_message(
-                                        chat_id=owner,
-                                        text=(
-                                            "AUTO BUY\n"
-                                            f"- symbol: {symbol}\n"
-                                            f"- spent: {decision.quote_amount:.2f} {quote_cur} (cap {quote_cap:.2f})\n"
-                                            f"- price: {res.fill_price if res.fill_price is not None else 'n/a'}\n"
-                                            f"- reason: mom_1h={fmt_pct(sig.mom_1h)}>= {fmt_pct(risk.mom_1h_threshold)} AND mom_15m={fmt_pct(sig.mom_15m)}>= {fmt_pct(risk.mom_15m_threshold)}\n"
-                                            f"- order_id: {res.order_id}\n"
-                                        ),
-                                    )
-                                else:
-                                    metrics["last_trade_action"] = f"BUY FAILED {symbol} ({exec_mode})"
-                                    metrics["last_trade_ts"] = now.timestamp()
-                                    await context.application.bot.send_message(
-                                        chat_id=owner,
-                                        text=f"AUTO BUY FAILED\n- symbol: {symbol}\n- error: {res.error}",
-                                    )
-
             # Track sign of mom_15m (for reversal alerts on open positions)
             mom_sign = 1 if sig.mom_15m > 0 else (-1 if sig.mom_15m < 0 else 0)
             last_mom15_sign[symbol] = mom_sign
@@ -1018,6 +994,42 @@ async def scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         metrics["last_scan_note"] = "scan loop exception"
         metrics["last_scan_completed"] = datetime.now(cfg.tz).timestamp()
         return
+
+    # Execute at most one AUTO BUY per scan (single-position mode enforced in decide_autobuy).
+    if autotrade_on and best_candidate is not None:
+        symbol, sig = best_candidate
+        decision = decide_autobuy(
+            store=store,
+            symbol=symbol,
+            quote_cap_total=quote_cap,
+            quote_currency=quote_cur,
+            min_trade_quote=10.0,
+        )
+        if decision.action == "BUY" and decision.quote_amount:
+            res = await asyncio.to_thread(executor.buy_quote, symbol, float(decision.quote_amount))
+            owner = await _get_owner_chat_id(context)
+            if owner is not None:
+                if res.ok:
+                    metrics["last_trade_action"] = f"BUY {symbol} {decision.quote_amount:.2f} {quote_cur} ({exec_mode})"
+                    metrics["last_trade_ts"] = now.timestamp()
+                    await context.application.bot.send_message(
+                        chat_id=owner,
+                        text=(
+                            "AUTO BUY\n"
+                            f"- symbol: {symbol}\n"
+                            f"- spent: {decision.quote_amount:.2f} {quote_cur} (cap {quote_cap:.2f})\n"
+                            f"- price: {res.fill_price if res.fill_price is not None else 'n/a'}\n"
+                            f"- reason: mom_1h={fmt_pct(sig.mom_1h)}>= {fmt_pct(risk.mom_1h_threshold)} AND mom_15m={fmt_pct(sig.mom_15m)}>= {fmt_pct(risk.mom_15m_threshold)}\n"
+                            f"- order_id: {res.order_id}\n"
+                        ),
+                    )
+                else:
+                    metrics["last_trade_action"] = f"BUY FAILED {symbol} ({exec_mode})"
+                    metrics["last_trade_ts"] = now.timestamp()
+                    await context.application.bot.send_message(
+                        chat_id=owner,
+                        text=f"AUTO BUY FAILED\n- symbol: {symbol}\n- error: {res.error}",
+                    )
 
     # Evaluate trailing stops / reversal alerts for OPEN positions
     positions = await asyncio.to_thread(store.list_positions)

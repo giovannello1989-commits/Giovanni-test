@@ -48,6 +48,8 @@ Consigliate:
 - `DB_PATH` (default `bot.db`)
 - `STATUS_PING_MINUTES` (default `30`) → recap “stato bot” periodico
 - `STATUS_PING_ALWAYS` (default `0`) → se `1` manda lo status anche fuori 09:00–20:00
+- `MARKET_DATA_PROVIDER` (default `binance`) → fonte dati per segnali (no Revolut)
+- `MARKET_DATA_QUOTE` (default uguale a `base_currency`, es. `EUR`) → valuta quote per pairs (es. EUR o USDT)
 - `ENABLE_WEB_SETUP` (default `0`) → se `1` avvia il wizard web
 - `SETUP_ADMIN_TOKEN` (obbligatorio se `ENABLE_WEB_SETUP=1`) → token admin per proteggere la pagina
 - `WEB_PORT` (default `8080`, su alcuni provider usa `PORT`)

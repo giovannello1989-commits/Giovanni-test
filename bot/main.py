@@ -19,6 +19,7 @@ from telegram.ext import (
 )
 
 from bot.config import RISK_PROFILES, AppConfig, is_within_operating_window, load_config
+from bot.marketdata import MarketDataClient, create_market_data_client
 from bot.revolutx import RevolutXClient
 from bot.storage import Storage
 from bot.strategy import compute_momentum_from_5m_candles, fmt_pct
@@ -179,6 +180,8 @@ async def _build_status_text(context: ContextTypes.DEFAULT_TYPE) -> str:
 
     base_url = st.get("revolutx_base_url") or cfg.revolutx_base_url
     base_path = st.get("revolutx_base_path") or cfg.revolutx_base_path
+    md_provider = context.application.bot_data.get("md_provider", "binance")
+    md_quote = context.application.bot_data.get("md_quote", "EUR")
 
     # Plain text on purpose: avoids Telegram parse errors (HTML/Markdown entities).
     text = (
@@ -208,6 +211,10 @@ async def _build_status_text(context: ContextTypes.DEFAULT_TYPE) -> str:
         f"- base_url: {base_url}\n"
         f"- base_path: {base_path}\n"
         f"- api_key presente: {bool(cfg.revolutx_api_key)}\n"
+        "\n"
+        "MARKET DATA\n"
+        f"- provider: {md_provider}\n"
+        f"- quote: {md_quote}\n"
     )
     last_error = metrics.get("last_error")
     if last_error:
@@ -795,25 +802,14 @@ async def scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     risk = RISK_PROFILES.get(st["risk_mode"], RISK_PROFILES["aggressive"])
-    # Allow base url/path overrides from DB (non-secrets)
-    base_url = st.get("revolutx_base_url") or cfg.revolutx_base_url
-    base_path = st.get("revolutx_base_path") or cfg.revolutx_base_path
-    client: RevolutXClient = context.application.bot_data["rx"]
-    if client.base_url != base_url.rstrip("/") or client.base_path.strip() != (base_path or "").strip():
-        client = RevolutXClient(
-            base_url=base_url,
-            base_path=base_path,
-            api_key=cfg.revolutx_api_key,
-            timeout_seconds=cfg.revolutx_timeout_seconds,
-        )
-        context.application.bot_data["rx"] = client
+    md: MarketDataClient = context.application.bot_data["md"]
 
     metrics: dict[str, Any] = context.application.bot_data.setdefault("metrics", {})
     metrics["last_scan_started"] = now.timestamp()
 
-    # Load pairs (read-only). If endpoint mismatch, it'll return [] and we just skip.
+    # Load pairs from market data provider.
     try:
-        pairs = await asyncio.to_thread(client.get_pairs)
+        pairs = await asyncio.to_thread(md.get_pairs)
     except Exception as e:
         metrics["scans_err"] = int(metrics.get("scans_err", 0)) + 1
         metrics["last_error"] = f"get_pairs error: {repr(e)}"
@@ -836,7 +832,7 @@ async def scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     # Scan momentum for candidate BUY signals
     try:
         for symbol in pairs:
-            candles = await asyncio.to_thread(client.get_candles, symbol, "5m", None, None, 13)
+            candles = await asyncio.to_thread(md.get_candles, symbol, "5m", 13)
             sig = compute_momentum_from_5m_candles(symbol, candles)
             if not sig:
                 continue
@@ -877,7 +873,7 @@ async def scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     # Evaluate trailing stops / reversal alerts for OPEN positions
     positions = await asyncio.to_thread(store.list_positions)
     for p in positions:
-        last_price = await asyncio.to_thread(client.get_last_price, p.symbol)
+        last_price = await asyncio.to_thread(md.get_last_price, p.symbol)
         if last_price is None:
             continue
 
@@ -907,7 +903,7 @@ async def scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             )
 
         # Reversal: mom_15m negative after being positive (best-effort)
-        candles = await asyncio.to_thread(client.get_candles, p.symbol, "5m", None, None, 13)
+        candles = await asyncio.to_thread(md.get_candles, p.symbol, "5m", 13)
         sig = compute_momentum_from_5m_candles(p.symbol, candles)
         if sig:
             prev = last_mom15_sign.get(p.symbol, 0)
@@ -1034,10 +1030,18 @@ def build_app(cfg: AppConfig) -> Application:
         timeout_seconds=cfg.revolutx_timeout_seconds,
     )
 
+    # Market data provider (default: Binance public, no key)
+    md_provider = os.getenv("MARKET_DATA_PROVIDER", "binance")
+    md_quote = os.getenv("MARKET_DATA_QUOTE", st.get("base_currency", "EUR")) or "EUR"
+    md = create_market_data_client(md_provider, quote=md_quote, timeout_seconds=cfg.revolutx_timeout_seconds)
+
     app = Application.builder().token(cfg.telegram_bot_token).build()
     app.bot_data["cfg"] = cfg
     app.bot_data["store"] = store
     app.bot_data["rx"] = rx
+    app.bot_data["md"] = md
+    app.bot_data["md_provider"] = md_provider
+    app.bot_data["md_quote"] = md_quote
     app.bot_data["last_signal_by_symbol"] = {}
     app.bot_data["last_mom15_sign"] = {}
     app.bot_data["metrics"] = {}

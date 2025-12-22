@@ -113,33 +113,29 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     st = await asyncio.to_thread(store.get_settings)
     risk = RISK_PROFILES.get(st["risk_mode"], RISK_PROFILES["aggressive"])
 
-    # If user hasn't configured starting capital yet, offer setup wizard.
-    if float(st.get("starting_capital", 0.0)) <= 0.0:
-        kb = InlineKeyboardMarkup(
-            [
-                [InlineKeyboardButton("Inizia setup guidato", callback_data=SETUP_START_CB)],
-            ]
-        )
-        await update.message.reply_text(
-            "Prima configurazione: vuoi impostare capitale/valuta/risk con un wizard step-by-step?",
-            reply_markup=kb,
-        )
-
     now = datetime.now(cfg.tz)
+    run_mode = (st.get("mode") or "session").lower()
+    autotrade_enabled = bool(int(st.get("autotrade_enabled", 0)))
+    autotrade_mode = st.get("autotrade_mode", "paper")
+    cap_amt = st.get("autotrade_max_quote", 100.0)
+    cap_cur = st.get("autotrade_quote_currency", "USDT")
+
     msg = (
-        "*Revolut X Momentum Bot (read-only)*\n\n"
-        "- Nessun trading automatico: solo segnali.\n"
-        "- Finestra operativa: 09:00–20:00 (Europe/Rome).\n"
-        "- Alert hard-close: 19:{hard_min:02d}\n"
-        "- Recap: 20:00\n\n"
-        f"*Stato*\n"
-        f"- Ora: `{now.isoformat(timespec='seconds')}`\n"
-        f"- Paused: `{bool(st['paused'])}`\n"
-        f"- Risk: `{risk.name}` (mom_1h≥{fmt_pct(risk.mom_1h_threshold)}, mom_15m≥{fmt_pct(risk.mom_15m_threshold)}, trailing={fmt_pct(risk.trailing_stop_pct)})\n"
-        f"- Base currency: `{st['base_currency']}`\n"
-        f"- Starting capital: `{st['starting_capital']}`\n\n"
-        "Comandi: /status, /setcapital, /setrisk, /buy, /sell, /portfolio, /config, /pause, /resume, /reset\n"
-    ).format(hard_min=cfg.hard_close_time.minute)
+        "*Revolut X AutoTrade Bot*\n\n"
+        f"Stato:\n"
+        f"- ora: `{now.isoformat(timespec='seconds')}`\n"
+        f"- run mode: `{run_mode}` (always=24/7)\n"
+        f"- scanner paused: `{bool(st['paused'])}`\n"
+        f"- risk: `{risk.name}` (mom_1h≥{fmt_pct(risk.mom_1h_threshold)}, mom_15m≥{fmt_pct(risk.mom_15m_threshold)}, trailing={fmt_pct(risk.trailing_stop_pct)})\n"
+        f"- autotrade: `{autotrade_enabled}` mode=`{autotrade_mode}` cap=`{cap_amt} {cap_cur}`\n\n"
+        "Comandi principali:\n"
+        "- /status\n"
+        "- /wallet\n"
+        "- /setmode always|session\n"
+        "- /autotrade on|off\n"
+        "- /autotrade mode paper|live\n"
+        "- /autotrade cap <AMOUNT> <CUR>\n"
+    )
     await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
 
 

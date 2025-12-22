@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import html
 import logging
 import os
 import threading
@@ -181,40 +180,38 @@ async def _build_status_text(context: ContextTypes.DEFAULT_TYPE) -> str:
     base_url = st.get("revolutx_base_url") or cfg.revolutx_base_url
     base_path = st.get("revolutx_base_path") or cfg.revolutx_base_path
 
-    def esc(v: Any) -> str:
-        return html.escape(str(v), quote=False)
-
+    # Plain text on purpose: avoids Telegram parse errors (HTML/Markdown entities).
     text = (
-        "<b>Status bot</b><br/>"
-        f"- ora: <code>{esc(now.isoformat(timespec='seconds'))}</code><br/>"
-        f"- owner chat_id: <code>{esc(owner)}</code><br/>"
-        f"- paused: <code>{esc(paused)}</code><br/>"
-        f"- finestra: <code>{'OK' if within else 'NO'}</code> (09:00–20:00 {esc(cfg.tz_name)})<br/>"
-        f"- risk: <code>{esc(risk.name)}</code> (mom_1h≥{esc(fmt_pct(risk.mom_1h_threshold))}, mom_15m≥{esc(fmt_pct(risk.mom_15m_threshold))}, trailing={esc(fmt_pct(risk.trailing_stop_pct))})<br/>"
-        "<br/>"
-        "<b>Scanner</b><br/>"
-        f"- last scan started: <code>{esc(_fmt_ts(metrics.get('last_scan_started')))}</code><br/>"
-        f"- last scan completed: <code>{esc(_fmt_ts(metrics.get('last_scan_completed')))}</code><br/>"
-        f"- last pairs count: <code>{esc(last_pairs_count if last_pairs_count is not None else 'n/a')}</code><br/>"
-        f"- scans ok/err: <code>{esc(scans_ok)}/{esc(scans_err)}</code><br/>"
-        f"- last scan note: <code>{esc(metrics.get('last_scan_note') or 'n/a')}</code><br/>"
-        "<br/>"
-        "<b>Notifiche</b><br/>"
-        f"- signals sent (runtime): <code>{esc(signals_sent)}</code><br/>"
-        f"- last signal: <code>{esc(_fmt_ts(metrics.get('last_signal_ts')))}</code><br/>"
-        f"- perché potresti non riceverne: <code>{esc('; '.join(why))}</code><br/>"
-        "<br/>"
-        "<b>Portfolio (manuale)</b><br/>"
-        f"- posizioni aperte: <code>{esc(len(positions))}</code><br/>"
-        "<br/>"
-        "<b>Revolut X</b><br/>"
-        f"- base_url: <code>{esc(base_url)}</code><br/>"
-        f"- base_path: <code>{esc(base_path)}</code><br/>"
-        f"- api_key presente: <code>{esc(bool(cfg.revolutx_api_key))}</code><br/>"
+        "STATUS BOT\n"
+        f"- ora: {now.isoformat(timespec='seconds')}\n"
+        f"- owner chat_id: {owner}\n"
+        f"- paused: {paused}\n"
+        f"- finestra: {'OK' if within else 'NO'} (09:00–20:00 {cfg.tz_name})\n"
+        f"- risk: {risk.name} (mom_1h≥{fmt_pct(risk.mom_1h_threshold)}, mom_15m≥{fmt_pct(risk.mom_15m_threshold)}, trailing={fmt_pct(risk.trailing_stop_pct)})\n"
+        "\n"
+        "SCANNER\n"
+        f"- last scan started: {_fmt_ts(metrics.get('last_scan_started'))}\n"
+        f"- last scan completed: {_fmt_ts(metrics.get('last_scan_completed'))}\n"
+        f"- last pairs count: {last_pairs_count if last_pairs_count is not None else 'n/a'}\n"
+        f"- scans ok/err: {scans_ok}/{scans_err}\n"
+        f"- last scan note: {metrics.get('last_scan_note') or 'n/a'}\n"
+        "\n"
+        "NOTIFICHE\n"
+        f"- signals sent (runtime): {signals_sent}\n"
+        f"- last signal: {_fmt_ts(metrics.get('last_signal_ts'))}\n"
+        f"- perché potresti non riceverne: {'; '.join(why)}\n"
+        "\n"
+        "PORTFOLIO (manuale)\n"
+        f"- posizioni aperte: {len(positions)}\n"
+        "\n"
+        "REVOLUT X\n"
+        f"- base_url: {base_url}\n"
+        f"- base_path: {base_path}\n"
+        f"- api_key presente: {bool(cfg.revolutx_api_key)}\n"
     )
     last_error = metrics.get("last_error")
     if last_error:
-        text += "<br/><b>Ultimo errore</b><br/>" + f"<pre>{esc(str(last_error)[:800])}</pre>"
+        text += "\nULTIMO ERRORE\n" + str(last_error)[:800] + "\n"
     return text
 
 
@@ -226,7 +223,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     chat = update.effective_chat
     if owner is not None and chat and chat.id != owner:
         return
-    await update.message.reply_text(await _build_status_text(context), parse_mode=ParseMode.HTML)
+    await update.message.reply_text(await _build_status_text(context))
 
 
 async def cmd_config(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -945,7 +942,7 @@ async def status_ping_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     now = datetime.now(cfg.tz)
     if not always and not is_within_operating_window(now, cfg.window_start, cfg.window_end):
         return
-    await context.application.bot.send_message(chat_id=owner, text=await _build_status_text(context), parse_mode=ParseMode.HTML)
+    await context.application.bot.send_message(chat_id=owner, text=await _build_status_text(context))
 
 
 async def hard_close_job(context: ContextTypes.DEFAULT_TYPE) -> None:

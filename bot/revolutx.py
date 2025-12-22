@@ -227,7 +227,8 @@ class RevolutXClient:
                     time.sleep(backoff_seconds * (2**attempt))
                     continue
                 logger.warning("Revolut X request failed: %s %s (%s)", method, url, repr(last_err))
-                return None, None
+                # Use status=0 to indicate "no HTTP response" (network/DNS/TLS/etc.)
+                return 0, repr(last_err)
 
     def probe(self, relative_paths: list[str]) -> list[dict[str, Any]]:
         """

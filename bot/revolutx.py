@@ -133,7 +133,8 @@ class RevolutXClient:
             X-Revx-Timestamp
             X-Revx-Signature
         """
-        if not self.api_key:
+        api_key = (self.api_key or "").strip()
+        if not api_key:
             return {}
         pk = self._load_private_key()
         if not pk:
@@ -143,7 +144,7 @@ class RevolutXClient:
         sig = pk.sign(msg.encode("utf-8"))
         sig_b64 = base64.b64encode(sig).decode("ascii")
         return {
-            "X-Revx-API-Key": self.api_key,
+            "X-Revx-API-Key": api_key,
             "X-Revx-Timestamp": ts_ms,
             "X-Revx-Signature": sig_b64,
         }

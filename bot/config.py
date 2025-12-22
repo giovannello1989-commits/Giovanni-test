@@ -136,6 +136,8 @@ def load_config() -> AppConfig:
     # Paths in doc start with /api/..., so base path should usually be empty.
     revolutx_base_path = (_env("REVOLUTX_BASE_PATH", "") or "").rstrip("/")
     revolutx_api_key = _env("REVOLUTX_API_KEY")
+    if revolutx_api_key is not None:
+        revolutx_api_key = revolutx_api_key.strip()
     revolutx_timeout_seconds = _env_int("REVOLUTX_TIMEOUT_SECONDS", 10)
 
     scan_interval_seconds = _env_int("SCAN_INTERVAL_SECONDS", 60)

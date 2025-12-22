@@ -41,10 +41,16 @@ class RevolutXEndpoints:
     config_currencies: str = "/api/1.0/configuration/currencies"
     config_currency_pairs: str = "/api/1.0/configuration/currency-pairs"
 
-    pairs: str = "/api/1.0/pairs"  # unknown in your account (404); keep configurable
-    candles: str = "/api/1.0/candles"  # unknown in your account (404); keep configurable
-    ticker: str = "/api/1.0/ticker"  # unknown in your account (404); keep configurable
+    # --- Configuration (documented) ---
+    config_currencies: str = "/api/1.0/configuration/currencies"  # confirmed 200 in your account
+    # NOTE: some accounts expose a different currency-pairs path. We'll probe multiple candidates in code.
+    config_currency_pairs: str = "/api/1.0/configuration/currency-pairs"
 
+    # --- Public market data (documented) ---
+    public_last_trades: str = "/api/1.0/public/last-trades"
+    public_order_book: str = "/api/1.0/public/order-book/{symbol}"
+
+    # --- Account ---
     balances: str = "/api/1.0/balances"  # confirmed 200
 
     # Trading / orders (confirmed /active = 200)
@@ -56,9 +62,6 @@ class RevolutXEndpoints:
 
     # Trades / fills
     private_trades_by_symbol: str = "/api/1.0/trades/private/{symbol}"
-
-    # Configuration (currencies list confirmed 200 in your account)
-    config_currencies: str = "/api/1.0/configuration/currencies"
 
 
 class RevolutXClient:
@@ -376,29 +379,33 @@ class RevolutXClient:
 
     def get_last_price(self, symbol: str, interval_fallback: str = "5m") -> float | None:
         """
-        Try ticker endpoint if available; otherwise fallback to last candle close.
+        Revolut X REST: prefer public last-trades for price discovery.
         """
-        data = self._request_json("GET", self.endpoints.ticker, params={"symbol": symbol})
-        if isinstance(data, dict):
-            for key in ("last", "lastPrice", "price", "last_price"):
-                if key in data and data[key] is not None:
+        data = self._request_json("GET", self.endpoints.public_last_trades)
+        if isinstance(data, dict) and isinstance(data.get("data"), list):
+            for it in data["data"]:
+                if not isinstance(it, dict):
+                    continue
+                if str(it.get("symbol", "")).upper() != symbol.upper():
+                    continue
+                px = it.get("price") or it.get("last_price") or it.get("lastPrice")
+                if px is not None:
                     try:
-                        return float(data[key])
+                        return float(px)
                     except Exception:
-                        pass
-            # Sometimes: {"ticker": {"last": ...}}
-            t = data.get("ticker")
-            if isinstance(t, dict):
-                v = t.get("last") or t.get("price")
-                if v is not None:
+                        return None
+        elif isinstance(data, list):
+            for it in data:
+                if not isinstance(it, dict):
+                    continue
+                if str(it.get("symbol", "")).upper() != symbol.upper():
+                    continue
+                px = it.get("price") or it.get("last_price") or it.get("lastPrice")
+                if px is not None:
                     try:
-                        return float(v)
+                        return float(px)
                     except Exception:
-                        pass
-
-        candles = self.get_candles(symbol=symbol, interval=interval_fallback, limit=1)
-        if candles:
-            return float(candles[-1]["close"])
+                        return None
         return None
 
     # --- Optional private read-only endpoints (only if API supports them) ---
@@ -427,6 +434,52 @@ class RevolutXClient:
                     out.append(str(it["symbol"]).upper())
             return sorted(set(out))
         return []
+
+    def get_currency_pairs(self) -> list[str]:
+        """
+        Try to fetch tradable currency pairs from configuration endpoint.
+        Because some deployments differ, try a small set of candidate paths.
+
+        Returns symbols like "BTC-USD".
+        """
+        candidates = [
+            self.endpoints.config_currency_pairs,
+            "/api/1.0/configuration/currency_pairs",
+            "/api/1.0/configuration/currencyPairs",
+            "/api/1.0/configuration/currency-pairs",
+            "/api/1.0/configuration/pairs",
+        ]
+        data = None
+        for path in candidates:
+            status, payload = self._request("GET", path, retries=0)
+            if status == 200:
+                data = payload
+                break
+        if not data:
+            return []
+
+        # Shapes seen in docs: list or {"data":[...]}
+        items = []
+        if isinstance(data, dict) and isinstance(data.get("data"), list):
+            items = data["data"]
+        elif isinstance(data, list):
+            items = data
+        elif isinstance(data, dict) and isinstance(data.get("pairs"), list):
+            items = data["pairs"]
+
+        out: list[str] = []
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            sym = it.get("symbol")
+            if sym:
+                out.append(str(sym).upper())
+                continue
+            base = it.get("base") or it.get("base_currency") or it.get("baseCurrency")
+            quote = it.get("quote") or it.get("quote_currency") or it.get("quoteCurrency")
+            if base and quote:
+                out.append(f"{str(base).upper()}-{str(quote).upper()}")
+        return sorted(set(out))
 
     def pair_exists_via_trades_private(self, symbol: str) -> bool:
         """

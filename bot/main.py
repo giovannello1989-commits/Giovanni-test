@@ -1347,6 +1347,32 @@ def build_app(cfg: AppConfig) -> Application:
     store = Storage(cfg.db_path)
     # Bootstrap RevolutX base url/path from settings if present (non-secrets)
     st = store.get_settings()
+
+    # Optional auto-start configuration via ENV (so you don't need manual commands).
+    # Applied at process start (after redeploy).
+    auto_mode = os.getenv("AUTO_START_MODE")  # "always" | "session"
+    auto_autotrade = os.getenv("AUTO_START_AUTOTRADE")  # "1" or "0"
+    auto_autotrade_mode = os.getenv("AUTO_START_AUTOTRADE_MODE")  # "paper" | "live"
+    auto_cap_amt = os.getenv("AUTO_START_AUTOTRADE_CAP")
+    auto_cap_cur = os.getenv("AUTO_START_AUTOTRADE_CUR")
+    updates: dict[str, Any] = {}
+    if auto_mode in ("always", "session"):
+        updates["mode"] = auto_mode
+    if auto_autotrade in ("1", "0"):
+        updates["autotrade_enabled"] = int(auto_autotrade)
+        if auto_autotrade == "1":
+            updates.setdefault("mode", "always")
+    if auto_autotrade_mode in ("paper", "live"):
+        updates["autotrade_mode"] = auto_autotrade_mode
+    if auto_cap_amt:
+        amt = _parse_float(auto_cap_amt)
+        if amt and amt > 0:
+            updates["autotrade_max_quote"] = float(amt)
+    if auto_cap_cur:
+        updates["autotrade_quote_currency"] = auto_cap_cur.upper()
+    if updates:
+        store.update_settings(**updates)
+        st = store.get_settings()
     base_url = st.get("revolutx_base_url") or cfg.revolutx_base_url
     base_path = st.get("revolutx_base_path") or cfg.revolutx_base_path
     private_pem = os.getenv("REVOLUTX_ED25519_PRIVATE_KEY_PEM")

@@ -261,6 +261,8 @@ async def cmd_revxprobe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     rx: RevolutXClient = context.application.bot_data["rx"]
     candidates = [
         "/api/1.0/balances",
+        "/api/1.0/configuration/currencies",
+        "/api/1.0/configuration/currency-pairs",
         "/api/1.0/pairs",
         "/api/1.0/symbols",
         "/api/1.0/instruments",

@@ -34,6 +34,13 @@ class RevolutXEndpoints:
     # (example from docs: /api/1.0/orders).
     #
     # Keep these centralized so you can update them quickly.
+    #
+    # Configuration endpoints (from doc):
+    # - GET /api/1.0/configuration/currencies
+    # - GET /api/1.0/configuration/currency-pairs
+    config_currencies: str = "/api/1.0/configuration/currencies"
+    config_currency_pairs: str = "/api/1.0/configuration/currency-pairs"
+
     pairs: str = "/api/1.0/pairs"  # unknown in your account (404); keep configurable
     candles: str = "/api/1.0/candles"  # unknown in your account (404); keep configurable
     ticker: str = "/api/1.0/ticker"  # unknown in your account (404); keep configurable
@@ -256,18 +263,26 @@ class RevolutXClient:
     # --- Public API ---
     def get_pairs(self) -> list[str]:
         """
-        Returns list of tradable symbols/pairs (e.g., ["BTC-EUR", "ETH-EUR"]).
-        Adjust parsing to match Revolut X docs.
+        Returns list of tradable symbols/pairs (e.g., ["BTC-USD", "ETH-USD"]).
+
+        Prefer the official configuration endpoint:
+          GET /api/1.0/configuration/currency-pairs
         """
-        data = self._request_json("GET", self.endpoints.pairs)
+        data = self._request_json("GET", self.endpoints.config_currency_pairs)
         if not data:
-            return []
+            # Fallback for older/unknown deployments
+            data = self._request_json("GET", self.endpoints.pairs)
+            if not data:
+                return []
 
         # Common shapes:
-        # - {"pairs": [{"symbol": "BTC-EUR"}, ...]}
-        # - [{"symbol": "BTC-EUR"}, ...]
+        # - {"data": [{"symbol": "BTC-USD"}, ...]}
+        # - {"pairs": [{"symbol": "BTC-USD"}, ...]}
+        # - [{"symbol": "BTC-USD"}, ...]
         if isinstance(data, dict) and "pairs" in data and isinstance(data["pairs"], list):
             items = data["pairs"]
+        elif isinstance(data, dict) and "data" in data and isinstance(data["data"], list):
+            items = data["data"]
         elif isinstance(data, list):
             items = data
         else:
@@ -277,6 +292,12 @@ class RevolutXClient:
         for it in items:
             if isinstance(it, dict):
                 sym = it.get("symbol") or it.get("pair") or it.get("name")
+                if not sym:
+                    # Sometimes split base/quote fields
+                    base = it.get("base") or it.get("base_currency") or it.get("baseCurrency")
+                    quote = it.get("quote") or it.get("quote_currency") or it.get("quoteCurrency")
+                    if base and quote:
+                        sym = f"{base}-{quote}"
                 if sym:
                     out.append(str(sym).upper())
         return sorted(set(out))

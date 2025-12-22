@@ -28,6 +28,9 @@ DEFAULT_SETTINGS = {
     # Hard cap in quote currency (e.g., 100 USDT)
     "autotrade_max_quote": 100.0,
     "autotrade_quote_currency": "USDT",
+    # Market data (signals)
+    "market_data_provider": "binance",
+    "market_data_quote": "USDT",
 }
 
 
@@ -151,6 +154,8 @@ class Storage:
             _ensure_col("autotrade_mode", "autotrade_mode TEXT NOT NULL DEFAULT 'paper'", DEFAULT_SETTINGS["autotrade_mode"])
             _ensure_col("autotrade_max_quote", "autotrade_max_quote REAL NOT NULL DEFAULT 100.0", DEFAULT_SETTINGS["autotrade_max_quote"])
             _ensure_col("autotrade_quote_currency", "autotrade_quote_currency TEXT NOT NULL DEFAULT 'USDT'", DEFAULT_SETTINGS["autotrade_quote_currency"])
+            _ensure_col("market_data_provider", "market_data_provider TEXT NOT NULL DEFAULT 'binance'", DEFAULT_SETTINGS["market_data_provider"])
+            _ensure_col("market_data_quote", "market_data_quote TEXT NOT NULL DEFAULT 'USDT'", DEFAULT_SETTINGS["market_data_quote"])
 
             # Trades table migration for new columns
             trade_cols = [r["name"] for r in conn.execute("PRAGMA table_info(trades)").fetchall()]
@@ -188,6 +193,8 @@ class Storage:
             "autotrade_mode",
             "autotrade_max_quote",
             "autotrade_quote_currency",
+            "market_data_provider",
+            "market_data_quote",
         }
         fields = [(k, v) for k, v in kwargs.items() if k in allowed]
         if not fields:
@@ -213,7 +220,9 @@ class Storage:
                     autotrade_enabled=?,
                     autotrade_mode=?,
                     autotrade_max_quote=?,
-                    autotrade_quote_currency=?
+                    autotrade_quote_currency=?,
+                    market_data_provider=?,
+                    market_data_quote=?
                 WHERE id=1
                 """,
                 (
@@ -231,6 +240,8 @@ class Storage:
                     DEFAULT_SETTINGS["autotrade_mode"],
                     DEFAULT_SETTINGS["autotrade_max_quote"],
                     DEFAULT_SETTINGS["autotrade_quote_currency"],
+                    DEFAULT_SETTINGS["market_data_provider"],
+                    DEFAULT_SETTINGS["market_data_quote"],
                 ),
             )
 

@@ -19,6 +19,7 @@ from telegram.ext import (
 )
 
 from bot.config import RISK_PROFILES, AppConfig, is_within_operating_window, load_config
+from bot.autotrade import LiveRevolutXExecutor, PaperExecutor, decide_autobuy
 from bot.marketdata import MarketDataClient, create_market_data_client
 from bot.revolutx import RevolutXClient
 from bot.storage import Storage
@@ -158,6 +159,8 @@ async def _build_status_text(context: ContextTypes.DEFAULT_TYPE) -> str:
     scans_ok = int(metrics.get("scans_ok", 0))
     scans_err = int(metrics.get("scans_err", 0))
     signals_sent = int(metrics.get("signals_sent", 0))
+    last_trade_action = metrics.get("last_trade_action")
+    last_trade_ts = metrics.get("last_trade_ts")
 
     def _fmt_ts(v: Any) -> str:
         if not v:
@@ -203,6 +206,7 @@ async def _build_status_text(context: ContextTypes.DEFAULT_TYPE) -> str:
         f"- signals sent (runtime): {signals_sent}\n"
         f"- last signal: {_fmt_ts(metrics.get('last_signal_ts'))}\n"
         f"- perché potresti non riceverne: {'; '.join(why)}\n"
+        f"- last trade action: {last_trade_action or 'n/a'} @ {_fmt_ts(last_trade_ts)}\n"
         "\n"
         "PORTFOLIO (manuale)\n"
         f"- posizioni aperte: {len(positions)}\n"
@@ -215,6 +219,12 @@ async def _build_status_text(context: ContextTypes.DEFAULT_TYPE) -> str:
         "MARKET DATA\n"
         f"- provider: {md_provider}\n"
         f"- quote: {md_quote}\n"
+        "\n"
+        "AUTOTRADE\n"
+        f"- enabled: {bool(int(st.get('autotrade_enabled', 0)))}\n"
+        f"- mode: {st.get('autotrade_mode', 'paper')}\n"
+        f"- cap: {st.get('autotrade_max_quote', 100.0)} {st.get('autotrade_quote_currency', 'USDT')}\n"
+        f"- run mode: {st.get('mode', 'session')} (session=09-20, always=24/7)\n"
     )
     last_error = metrics.get("last_error")
     if last_error:
@@ -231,6 +241,98 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if owner is not None and chat and chat.id != owner:
         return
     await update.message.reply_text(await _build_status_text(context))
+
+
+async def cmd_setmode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    cfg: AppConfig = context.application.bot_data["cfg"]
+    if not _authorized(cfg, update):
+        return
+    owner = await _get_owner_chat_id(context)
+    chat = update.effective_chat
+    if owner is not None and chat and chat.id != owner:
+        return
+    if not context.args:
+        await update.message.reply_text("Uso: `/setmode session|always`", parse_mode=ParseMode.MARKDOWN)
+        return
+    mode = context.args[0].lower().strip()
+    if mode not in ("session", "always"):
+        await update.message.reply_text("Valore non valido. Usa: session|always")
+        return
+    store: Storage = context.application.bot_data["store"]
+    await asyncio.to_thread(store.update_settings, mode=mode)
+    await update.message.reply_text(f"OK. Mode impostato: {mode}.")
+
+
+async def cmd_autotrade(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /autotrade on|off
+    /autotrade mode paper|live
+    /autotrade cap 100 USDT
+    """
+    cfg: AppConfig = context.application.bot_data["cfg"]
+    if not _authorized(cfg, update):
+        return
+    owner = await _get_owner_chat_id(context)
+    chat = update.effective_chat
+    if owner is not None and chat and chat.id != owner:
+        return
+
+    store: Storage = context.application.bot_data["store"]
+    if not context.args:
+        st = await asyncio.to_thread(store.get_settings)
+        await update.message.reply_text(
+            "Uso:\n"
+            "- /autotrade on|off\n"
+            "- /autotrade mode paper|live\n"
+            "- /autotrade cap 100 USDT\n\n"
+            f"Stato: enabled={bool(int(st.get('autotrade_enabled',0)))}, mode={st.get('autotrade_mode','paper')}, cap={st.get('autotrade_max_quote',100)} {st.get('autotrade_quote_currency','USDT')}"
+        )
+        return
+
+    sub = context.args[0].lower()
+    if sub in ("on", "off"):
+        enabled = 1 if sub == "on" else 0
+        await asyncio.to_thread(store.update_settings, autotrade_enabled=enabled)
+        if enabled == 1:
+            # Force 24/7 as requested
+            await asyncio.to_thread(store.update_settings, mode="always")
+        await update.message.reply_text(f"OK. autotrade_enabled={bool(enabled)} (mode={'always' if enabled else (await asyncio.to_thread(store.get_settings)).get('mode','session')}).")
+        return
+
+    if sub == "mode":
+        if len(context.args) < 2:
+            await update.message.reply_text("Uso: `/autotrade mode paper|live`", parse_mode=ParseMode.MARKDOWN)
+            return
+        m = context.args[1].lower().strip()
+        if m not in ("paper", "live"):
+            await update.message.reply_text("Valore non valido. Usa: paper|live")
+            return
+        if m == "live":
+            # Safety: require explicit env confirmation, because Revolut X trading endpoints/signature must be correct.
+            if os.getenv("ALLOW_LIVE_TRADING", "0") != "1":
+                await update.message.reply_text(
+                    "LIVE trading è bloccato per sicurezza.\n"
+                    "Per abilitarlo devi impostare su Railway: `ALLOW_LIVE_TRADING=1` (e avere auth/endpoints Revolut X corretti)."
+                )
+                return
+        await asyncio.to_thread(store.update_settings, autotrade_mode=m)
+        await update.message.reply_text(f"OK. autotrade_mode={m}.")
+        return
+
+    if sub == "cap":
+        if len(context.args) < 3:
+            await update.message.reply_text("Uso: `/autotrade cap 100 USDT`", parse_mode=ParseMode.MARKDOWN)
+            return
+        amt = _parse_float(context.args[1])
+        cur = context.args[2].upper()
+        if amt is None or amt <= 0:
+            await update.message.reply_text("Importo non valido.")
+            return
+        await asyncio.to_thread(store.update_settings, autotrade_max_quote=float(amt), autotrade_quote_currency=cur)
+        await update.message.reply_text(f"OK. Cap autotrade: {amt:.2f} {cur}.")
+        return
+
+    await update.message.reply_text("Comando non riconosciuto. Usa: on|off|mode|cap")
 
 
 async def cmd_config(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -798,11 +900,15 @@ async def scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     now = datetime.now(cfg.tz)
-    if not is_within_operating_window(now, cfg.window_start, cfg.window_end):
-        return
+    run_mode = (st.get("mode") or "session").lower()
+    if run_mode != "always":
+        if not is_within_operating_window(now, cfg.window_start, cfg.window_end):
+            return
 
     risk = RISK_PROFILES.get(st["risk_mode"], RISK_PROFILES["aggressive"])
     md: MarketDataClient = context.application.bot_data["md"]
+    paper_exec: PaperExecutor = context.application.bot_data["paper_exec"]
+    live_exec: LiveRevolutXExecutor = context.application.bot_data["live_exec"]
 
     metrics: dict[str, Any] = context.application.bot_data.setdefault("metrics", {})
     metrics["last_scan_started"] = now.timestamp()
@@ -860,6 +966,47 @@ async def scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                         metrics["signals_sent"] = int(metrics.get("signals_sent", 0)) + 1
                         metrics["last_signal_ts"] = now_ts
 
+                # AUTO-TRADE (best effort): if enabled, try to buy with remaining budget up to cap.
+                if int(st.get("autotrade_enabled", 0)) == 1:
+                    quote_cap = float(st.get("autotrade_max_quote", 100.0))
+                    quote_cur = str(st.get("autotrade_quote_currency", "USDT")).upper()
+                    # Only trade symbols that match quote currency (e.g., *-USDT)
+                    if symbol.endswith(f"-{quote_cur}"):
+                        decision = decide_autobuy(
+                            store=store,
+                            symbol=symbol,
+                            quote_cap_total=quote_cap,
+                            quote_currency=quote_cur,
+                            min_trade_quote=10.0,
+                        )
+                        if decision.action == "BUY" and decision.quote_amount:
+                            exec_mode = str(st.get("autotrade_mode", "paper")).lower()
+                            ex = live_exec if exec_mode == "live" else paper_exec
+                            res = await asyncio.to_thread(ex.buy_quote, symbol, float(decision.quote_amount))
+                            owner = await _get_owner_chat_id(context)
+                            if owner is not None:
+                                if res.ok:
+                                    metrics["last_trade_action"] = f"BUY {symbol} {decision.quote_amount:.2f} {quote_cur} ({exec_mode})"
+                                    metrics["last_trade_ts"] = now.timestamp()
+                                    await context.application.bot.send_message(
+                                        chat_id=owner,
+                                        text=(
+                                            "AUTO BUY\n"
+                                            f"- symbol: {symbol}\n"
+                                            f"- spent: {decision.quote_amount:.2f} {quote_cur} (cap {quote_cap:.2f})\n"
+                                            f"- price: {res.fill_price if res.fill_price is not None else 'n/a'}\n"
+                                            f"- reason: mom_1h={fmt_pct(sig.mom_1h)}>= {fmt_pct(risk.mom_1h_threshold)} AND mom_15m={fmt_pct(sig.mom_15m)}>= {fmt_pct(risk.mom_15m_threshold)}\n"
+                                            f"- order_id: {res.order_id}\n"
+                                        ),
+                                    )
+                                else:
+                                    metrics["last_trade_action"] = f"BUY FAILED {symbol} ({exec_mode})"
+                                    metrics["last_trade_ts"] = now.timestamp()
+                                    await context.application.bot.send_message(
+                                        chat_id=owner,
+                                        text=f"AUTO BUY FAILED\n- symbol: {symbol}\n- error: {res.error}",
+                                    )
+
             # Track sign of mom_15m (for reversal alerts on open positions)
             mom_sign = 1 if sig.mom_15m > 0 else (-1 if sig.mom_15m < 0 else 0)
             last_mom15_sign[symbol] = mom_sign
@@ -889,6 +1036,36 @@ async def scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             owner = await _get_owner_chat_id(context)
             if owner is None:
                 continue
+            # If autotrade enabled: auto-sell
+            if int(st.get("autotrade_enabled", 0)) == 1:
+                exec_mode = str(st.get("autotrade_mode", "paper")).lower()
+                ex = live_exec if exec_mode == "live" else paper_exec
+                res = await asyncio.to_thread(ex.sell_all, p.symbol)
+                if res.ok:
+                    # realized PnL is stored by storage.add_sell; compute quick % vs entry
+                    pnl_quote = (last_price - p.avg_entry) * p.qty
+                    pct = ((last_price - p.avg_entry) / p.avg_entry) if p.avg_entry else 0.0
+                    metrics["last_trade_action"] = f"SELL {p.symbol} ({exec_mode}) pnl≈{pnl_quote:+.2f}"
+                    metrics["last_trade_ts"] = now.timestamp()
+                    await context.application.bot.send_message(
+                        chat_id=owner,
+                        text=(
+                            "AUTO SELL (trailing stop)\n"
+                            f"- symbol: {p.symbol}\n"
+                            f"- last: {last_price:.8g}\n"
+                            f"- entry: {p.avg_entry:.8g}\n"
+                            f"- peak: {peak:.8g}\n"
+                            f"- pnl≈ {pnl_quote:+.2f} ({pct*100:+.2f}%)\n"
+                            f"- reason: last <= peak*(1-{risk.trailing_stop_pct*100:.2f}%)\n"
+                            f"- order_id: {res.order_id}\n"
+                        ),
+                    )
+                    continue
+                else:
+                    await context.application.bot.send_message(
+                        chat_id=owner,
+                        text=f"AUTO SELL FAILED\n- symbol: {p.symbol}\n- error: {res.error}",
+                    )
             await context.application.bot.send_message(
                 chat_id=owner,
                 text=(
@@ -1042,6 +1219,9 @@ def build_app(cfg: AppConfig) -> Application:
         revolutx_api_key=cfg.revolutx_api_key,
     )
 
+    paper_exec = PaperExecutor(md=md, store=store)
+    live_exec = LiveRevolutXExecutor(rx_client=rx, store=store, md=md)
+
     app = Application.builder().token(cfg.telegram_bot_token).build()
     app.bot_data["cfg"] = cfg
     app.bot_data["store"] = store
@@ -1049,6 +1229,8 @@ def build_app(cfg: AppConfig) -> Application:
     app.bot_data["md"] = md
     app.bot_data["md_provider"] = md_provider
     app.bot_data["md_quote"] = md_quote
+    app.bot_data["paper_exec"] = paper_exec
+    app.bot_data["live_exec"] = live_exec
     app.bot_data["last_signal_by_symbol"] = {}
     app.bot_data["last_mom15_sign"] = {}
     app.bot_data["metrics"] = {}
@@ -1063,6 +1245,8 @@ def build_app(cfg: AppConfig) -> Application:
     app.add_handler(CommandHandler("sell", cmd_sell))
     app.add_handler(CommandHandler("portfolio", cmd_portfolio))
     app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("setmode", cmd_setmode))
+    app.add_handler(CommandHandler("autotrade", cmd_autotrade))
     app.add_handler(CommandHandler("reset", cmd_reset))
     app.add_handler(CommandHandler("setup", cmd_setup))
     app.add_handler(CallbackQueryHandler(on_reset_callback, pattern=f"^{RESET_CONFIRM_CB}$|^{RESET_CANCEL_CB}$"))

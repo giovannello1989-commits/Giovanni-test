@@ -62,6 +62,7 @@ ENV (segreti):
 
 - `REVOLUTX_API_KEY` = stringa alfanumerica (64 char) fornita da Revolut X
 - `REVOLUTX_ED25519_PRIVATE_KEY_PEM` = contenuto completo di `private.pem` (inclusi `BEGIN/END`)
+- `REVOLUTX_ED25519_PRIVATE_KEY_PEM_B64` = alternativa più affidabile (base64 di `private.pem`, senza newline)
 
 Header auth richiesti (gestiti dal client):
 

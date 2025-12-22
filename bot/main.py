@@ -4,6 +4,7 @@ import asyncio
 import logging
 import os
 import threading
+import base64
 from datetime import datetime, timezone
 from typing import Any
 
@@ -1253,11 +1254,20 @@ def build_app(cfg: AppConfig) -> Application:
     st = store.get_settings()
     base_url = st.get("revolutx_base_url") or cfg.revolutx_base_url
     base_path = st.get("revolutx_base_path") or cfg.revolutx_base_path
+    private_pem = os.getenv("REVOLUTX_ED25519_PRIVATE_KEY_PEM")
+    if not private_pem:
+        b64 = os.getenv("REVOLUTX_ED25519_PRIVATE_KEY_PEM_B64")
+        if b64:
+            try:
+                private_pem = base64.b64decode(b64.encode("utf-8")).decode("utf-8")
+            except Exception:
+                private_pem = None
+
     rx = RevolutXClient(
         base_url=base_url,
         base_path=base_path,
         api_key=cfg.revolutx_api_key,
-        private_key_pem=os.getenv("REVOLUTX_ED25519_PRIVATE_KEY_PEM"),
+        private_key_pem=private_pem,
         timeout_seconds=cfg.revolutx_timeout_seconds,
     )
 

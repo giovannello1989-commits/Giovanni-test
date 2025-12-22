@@ -137,15 +137,27 @@ class LiveRevolutXExecutor:
         self.store = store
         self.md = md
 
+    def _balance_available(self, currency: str) -> float | None:
+        data = self.rx.get_balances()
+        if not isinstance(data, list):
+            return None
+        cur = currency.upper()
+        for row in data:
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("currency", "")).upper() != cur:
+                continue
+            av = row.get("available")
+            try:
+                return float(av)
+            except Exception:
+                return None
+        return None
+
     def buy_quote(self, symbol: str, quote_amount: float) -> ExecResult:
         client_oid = f"auto-{uuid.uuid4().hex[:12]}"
-        data = self.rx.place_order(
-            symbol=symbol,
-            side="BUY",
-            order_type="MARKET",
-            quote_amount=quote_amount,
-            client_order_id=client_oid,
-        )
+        # Use quote_size (spend quote currency amount) as per Revolut X docs.
+        data = self.rx.place_order(symbol=symbol, side="buy", client_order_id=client_oid, market_quote_size=f"{quote_amount:.8f}")
         if not data:
             return ExecResult(False, None, None, "place_order returned null (check endpoint/payload/auth)")
         order_id = None
@@ -169,19 +181,13 @@ class LiveRevolutXExecutor:
         return ExecResult(True, order_id or client_oid, px, None)
 
     def sell_all(self, symbol: str) -> ExecResult:
-        positions = self.store.list_positions()
-        pos = next((p for p in positions if p.symbol.upper() == symbol.upper()), None)
-        if pos is None or pos.qty <= 0:
-            return ExecResult(False, None, None, "no position")
-
+        # Prefer selling available balance of base currency (safer than relying on local qty).
+        base = symbol.split("-")[0].upper() if "-" in symbol else symbol.upper()
+        base_av = self._balance_available(base)
+        if base_av is None or base_av <= 0:
+            return ExecResult(False, None, None, f"no available balance for {base}")
         client_oid = f"auto-{uuid.uuid4().hex[:12]}"
-        data = self.rx.place_order(
-            symbol=symbol,
-            side="SELL",
-            order_type="MARKET",
-            base_amount=float(pos.qty),
-            client_order_id=client_oid,
-        )
+        data = self.rx.place_order(symbol=symbol, side="sell", client_order_id=client_oid, market_base_size=f"{base_av:.8f}")
         if not data:
             return ExecResult(False, None, None, "place_order returned null (check endpoint/payload/auth)")
         order_id = None
@@ -197,7 +203,7 @@ class LiveRevolutXExecutor:
         if px is not None:
             self.store.add_sell(
                 symbol=symbol,
-                amount_base=float(pos.qty) * float(px),
+                amount_base=float(base_av) * float(px),
                 price=float(px),
                 source="autotrade-live",
                 order_id=order_id or client_oid,

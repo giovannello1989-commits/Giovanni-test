@@ -261,7 +261,6 @@ async def cmd_revxprobe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     rx: RevolutXClient = context.application.bot_data["rx"]
     candidates = [
         "/api/1.0/balances",
-        "/api/1.0/accounts",
         "/api/1.0/pairs",
         "/api/1.0/symbols",
         "/api/1.0/instruments",
@@ -271,8 +270,11 @@ async def cmd_revxprobe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "/api/1.0/candles",
         "/api/1.0/klines",
         "/api/1.0/orders/active",
+        "/api/1.0/orders/historical",
         "/api/1.0/orders",
         "/api/1.0/trades",
+        "/api/1.0/trades/private/BTC-USD",
+        "/api/1.0/trades/private/BTC-USDT",
     ]
     results = await asyncio.to_thread(rx.probe, candidates)
     lines = ["REVX PROBE (GET)"]

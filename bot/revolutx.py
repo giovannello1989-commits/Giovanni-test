@@ -34,15 +34,21 @@ class RevolutXEndpoints:
     # (example from docs: /api/1.0/orders).
     #
     # Keep these centralized so you can update them quickly.
-    pairs: str = "/api/1.0/pairs"
-    candles: str = "/api/1.0/candles"
-    ticker: str = "/api/1.0/ticker"
-    balances: str = "/api/1.0/balances"
-    private_trades: str = "/api/1.0/trades"
-    # Trading (write) endpoints (placeholders — MUST match official docs)
-    place_order: str = "/api/1.0/orders"
-    cancel_order: str = "/api/1.0/orders/cancel"
-    order_status: str = "/api/1.0/orders"
+    pairs: str = "/api/1.0/pairs"  # unknown in your account (404); keep configurable
+    candles: str = "/api/1.0/candles"  # unknown in your account (404); keep configurable
+    ticker: str = "/api/1.0/ticker"  # unknown in your account (404); keep configurable
+
+    balances: str = "/api/1.0/balances"  # confirmed 200
+
+    # Trading / orders (confirmed /active = 200)
+    place_order: str = "/api/1.0/orders"  # POST (per doc)
+    active_orders: str = "/api/1.0/orders/active"
+    historical_orders: str = "/api/1.0/orders/historical"
+    order_by_id: str = "/api/1.0/orders/{venue_order_id}"
+    cancel_order_by_id: str = "/api/1.0/orders/{venue_order_id}"  # DELETE (per doc)
+
+    # Trades / fills
+    private_trades_by_symbol: str = "/api/1.0/trades/private/{symbol}"
 
 
 class RevolutXClient:
@@ -375,47 +381,54 @@ class RevolutXClient:
     def get_balances(self) -> Any | None:
         return self._request_json("GET", self.endpoints.balances)
 
-    def get_private_trades(self, symbol: str | None = None) -> Any | None:
-        params = {"symbol": symbol} if symbol else None
-        return self._request_json("GET", self.endpoints.private_trades, params=params)
+    def get_private_trades(self, symbol: str) -> Any | None:
+        path = self.endpoints.private_trades_by_symbol.format(symbol=symbol)
+        return self._request_json("GET", path)
 
     # --- Trading endpoints (ONLY if you enable trading and your key allows it) ---
     def place_order(
         self,
         symbol: str,
-        side: str,
-        order_type: str = "MARKET",
-        quote_amount: float | None = None,
-        base_amount: float | None = None,
-        client_order_id: str | None = None,
+        side: str,  # "buy" | "sell"
+        client_order_id: str,
+        market_base_size: str | None = None,
+        market_quote_size: str | None = None,
     ) -> Any | None:
         """
-        IMPORTANT: This is a generic placeholder implementation.
-        You MUST adapt payload/fields to Revolut X official trading docs.
-
-        Many exchanges support either:
-        - quote amount (spend X USDT)
-        - base amount (buy X BTC)
+        Revolut X docs:
+          POST /api/1.0/orders
+        Required:
+          - client_order_id
+          - symbol
+          - side: "buy"|"sell"
+          - order_configuration.market with exactly one of base_size or quote_size (strings)
         """
+        if (market_base_size is None) == (market_quote_size is None):
+            raise ValueError("Provide exactly one of market_base_size or market_quote_size")
+        market: dict[str, Any] = {}
+        if market_base_size is not None:
+            market["base_size"] = market_base_size
+        if market_quote_size is not None:
+            market["quote_size"] = market_quote_size
         payload: dict[str, Any] = {
+            "client_order_id": client_order_id,
             "symbol": symbol,
-            "side": side.upper(),
-            "type": order_type.upper(),
+            "side": side.lower(),
+            "order_configuration": {"market": market},
         }
-        if quote_amount is not None:
-            payload["quoteAmount"] = quote_amount
-        if base_amount is not None:
-            payload["baseAmount"] = base_amount
-        if client_order_id:
-            payload["clientOrderId"] = client_order_id
-
-        # Revolut X signing requires the minified JSON body to be part of the signature.
         return self._request_json("POST", self.endpoints.place_order, json_body=payload)
 
-    def cancel_order(self, order_id: str) -> Any | None:
-        payload = {"orderId": order_id}
-        return self._request_json("POST", self.endpoints.cancel_order, json_body=payload)
+    def get_active_orders(self) -> Any | None:
+        return self._request_json("GET", self.endpoints.active_orders)
 
-    def get_order_status(self, order_id: str) -> Any | None:
-        return self._request_json("GET", self.endpoints.order_status, params={"orderId": order_id})
+    def get_historical_orders(self) -> Any | None:
+        return self._request_json("GET", self.endpoints.historical_orders)
+
+    def get_order(self, venue_order_id: str) -> Any | None:
+        path = self.endpoints.order_by_id.format(venue_order_id=venue_order_id)
+        return self._request_json("GET", path)
+
+    def cancel_order(self, venue_order_id: str) -> Any | None:
+        path = self.endpoints.cancel_order_by_id.format(venue_order_id=venue_order_id)
+        return self._request_json("DELETE", path)
 

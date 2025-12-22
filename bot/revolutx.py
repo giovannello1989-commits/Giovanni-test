@@ -57,6 +57,9 @@ class RevolutXEndpoints:
     # Trades / fills
     private_trades_by_symbol: str = "/api/1.0/trades/private/{symbol}"
 
+    # Configuration (currencies list confirmed 200 in your account)
+    config_currencies: str = "/api/1.0/configuration/currencies"
+
 
 class RevolutXClient:
     def __init__(
@@ -405,6 +408,34 @@ class RevolutXClient:
     def get_private_trades(self, symbol: str) -> Any | None:
         path = self.endpoints.private_trades_by_symbol.format(symbol=symbol)
         return self._request_json("GET", path)
+
+    def get_currencies(self) -> list[str]:
+        """
+        Returns list of currency codes from:
+          GET /api/1.0/configuration/currencies
+        In your account this endpoint returns a dict keyed by currency code.
+        """
+        data = self._request_json("GET", self.endpoints.config_currencies)
+        if not data:
+            return []
+        if isinstance(data, dict):
+            return sorted({str(k).upper() for k in data.keys()})
+        if isinstance(data, list):
+            out = []
+            for it in data:
+                if isinstance(it, dict) and it.get("symbol"):
+                    out.append(str(it["symbol"]).upper())
+            return sorted(set(out))
+        return []
+
+    def pair_exists_via_trades_private(self, symbol: str) -> bool:
+        """
+        Uses trades/private/{symbol} as an existence check.
+        If it returns 200 (even with empty data), we treat pair as existing.
+        """
+        path = self.endpoints.private_trades_by_symbol.format(symbol=symbol)
+        status, _ = self._request("GET", path, retries=0)
+        return status == 200
 
     # --- Trading endpoints (ONLY if you enable trading and your key allows it) ---
     def place_order(

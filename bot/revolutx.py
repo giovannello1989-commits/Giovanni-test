@@ -84,6 +84,22 @@ class RevolutXClient:
         """
         return bool(self.api_key) and (self._load_private_key() is not None)
 
+    def derived_public_key_pem(self) -> str | None:
+        """
+        Returns the public key PEM derived from the loaded private key.
+        Useful to verify that the key registered in Revolut X matches the server key.
+        Public key is not secret.
+        """
+        pk = self._load_private_key()
+        if not pk:
+            return None
+        pub = pk.public_key()
+        pem = pub.public_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo,
+        )
+        return pem.decode("utf-8")
+
     @staticmethod
     def _minified_json(obj: Any) -> str:
         return json.dumps(obj, separators=(",", ":"), ensure_ascii=False)

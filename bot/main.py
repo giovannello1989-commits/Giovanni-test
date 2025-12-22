@@ -282,6 +282,25 @@ async def cmd_revxprobe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     lines.append("\nSe vedi 200 su balances/pairs/candles, mi hai trovato gli endpoint corretti.")
     await update.message.reply_text("\n".join(lines))
 
+
+async def cmd_revxpub(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Prints the public key PEM derived from the private key loaded on the server.
+    Paste this into Revolut X API key creation (public key field).
+    """
+    cfg: AppConfig = context.application.bot_data["cfg"]
+    if not _authorized(cfg, update):
+        return
+    owner = await _get_owner_chat_id(context)
+    chat = update.effective_chat
+    if owner is not None and chat and chat.id != owner:
+        return
+    rx: RevolutXClient = context.application.bot_data["rx"]
+    pem = await asyncio.to_thread(rx.derived_public_key_pem)
+    if not pem:
+        await update.message.reply_text("Nessuna private key caricata/leggibile sul server.")
+        return
+    await update.message.reply_text("PUBLIC KEY (derived from server private key):\n" + pem)
 async def cmd_setmode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     cfg: AppConfig = context.application.bot_data["cfg"]
     if not _authorized(cfg, update):
@@ -1310,6 +1329,7 @@ def build_app(cfg: AppConfig) -> Application:
     app.add_handler(CommandHandler("portfolio", cmd_portfolio))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("revxprobe", cmd_revxprobe))
+    app.add_handler(CommandHandler("revxpub", cmd_revxpub))
     app.add_handler(CommandHandler("setmode", cmd_setmode))
     app.add_handler(CommandHandler("autotrade", cmd_autotrade))
     app.add_handler(CommandHandler("reset", cmd_reset))

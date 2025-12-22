@@ -20,7 +20,7 @@ from telegram.ext import (
 )
 
 from bot.config import RISK_PROFILES, AppConfig, is_within_operating_window, load_config
-from bot.autotrade import LiveRevolutXExecutor, PaperExecutor, decide_autobuy
+from bot.autotrade import LiveRevolutXExecutor, PaperExecutor, decide_autobuy, total_open_notional
 from bot.marketdata import MarketDataClient, create_market_data_client
 from bot.revolutx import RevolutXClient
 from bot.storage import Storage
@@ -1033,11 +1033,10 @@ async def scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     autotrade_on = int(st.get("autotrade_enabled", 0)) == 1
     quote_cap = float(st.get("autotrade_max_quote", 100.0))
     quote_cur = str(st.get("autotrade_quote_currency", "USDT")).upper()
+    max_pos = int(st.get("autotrade_max_positions", 3))
     exec_mode = str(st.get("autotrade_mode", "paper")).lower()
     executor = live_exec if exec_mode == "live" else paper_exec
-
-    # Track best candidate this scan (so we open at most one position per scan).
-    best_candidate = None  # (symbol, sig)
+    candidates: list[tuple[str, Any]] = []
 
     # Scan momentum for candidate BUY signals
     try:
@@ -1048,10 +1047,9 @@ async def scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                 continue
 
             if sig.mom_1h >= risk.mom_1h_threshold and sig.mom_15m >= risk.mom_15m_threshold:
-                # Keep best candidate for auto-buy (highest 15m momentum)
+                # Collect candidates for auto-buy (we'll take top N)
                 if autotrade_on and symbol.endswith(f"-{quote_cur}"):
-                    if best_candidate is None or sig.mom_15m > best_candidate[1].mom_15m:
-                        best_candidate = (symbol, sig)
+                    candidates.append((symbol, sig))
 
                 now_ts = now.timestamp()
                 last_ts = float(last_signal_by_symbol.get(symbol, 0.0))
@@ -1085,41 +1083,51 @@ async def scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         metrics["last_scan_completed"] = datetime.now(cfg.tz).timestamp()
         return
 
-    # Execute at most one AUTO BUY per scan (single-position mode enforced in decide_autobuy).
-    if autotrade_on and best_candidate is not None:
-        symbol, sig = best_candidate
-        decision = decide_autobuy(
-            store=store,
-            symbol=symbol,
-            quote_cap_total=quote_cap,
-            quote_currency=quote_cur,
-            min_trade_quote=10.0,
-        )
-        if decision.action == "BUY" and decision.quote_amount:
-            res = await asyncio.to_thread(executor.buy_quote, symbol, float(decision.quote_amount))
-            owner = await _get_owner_chat_id(context)
-            if owner is not None:
+    # AUTO BUY: open up to max_pos positions, total exposure <= quote_cap.
+    if autotrade_on and candidates:
+        # Highest 15m momentum first
+        candidates.sort(key=lambda x: float(x[1].mom_15m), reverse=True)
+        owner = await _get_owner_chat_id(context)
+        if owner is not None:
+            for symbol, sig in candidates:
+                open_notional = await asyncio.to_thread(total_open_notional, store, quote_cur)
+                remaining = max(0.0, quote_cap - float(open_notional))
+                decision = decide_autobuy(
+                    store=store,
+                    symbol=symbol,
+                    quote_cap_total=quote_cap,
+                    quote_currency=quote_cur,
+                    min_trade_quote=10.0,
+                    max_positions=max_pos,
+                )
+                if decision.action != "BUY" or not decision.quote_amount:
+                    continue
+                spend = min(float(decision.quote_amount), remaining)
+                if spend < 10.0:
+                    continue
+                res = await asyncio.to_thread(executor.buy_quote, symbol, spend)
                 if res.ok:
-                    metrics["last_trade_action"] = f"BUY {symbol} {decision.quote_amount:.2f} {quote_cur} ({exec_mode})"
+                    metrics["last_trade_action"] = f"BUY {symbol} {spend:.2f} {quote_cur} ({exec_mode})"
                     metrics["last_trade_ts"] = now.timestamp()
                     await context.application.bot.send_message(
                         chat_id=owner,
                         text=(
                             "AUTO BUY\n"
                             f"- symbol: {symbol}\n"
-                            f"- spent: {decision.quote_amount:.2f} {quote_cur} (cap {quote_cap:.2f})\n"
+                            f"- spent: {spend:.2f} {quote_cur} (cap totale {quote_cap:.2f}, residuo pre-buy {remaining:.2f})\n"
                             f"- price: {res.fill_price if res.fill_price is not None else 'n/a'}\n"
-                            f"- reason: mom_1h={fmt_pct(sig.mom_1h)}>= {fmt_pct(risk.mom_1h_threshold)} AND mom_15m={fmt_pct(sig.mom_15m)}>= {fmt_pct(risk.mom_15m_threshold)}\n"
+                            f"- motivo: mom_1h={fmt_pct(sig.mom_1h)}≥{fmt_pct(risk.mom_1h_threshold)} AND mom_15m={fmt_pct(sig.mom_15m)}≥{fmt_pct(risk.mom_15m_threshold)}; top mover 15m; max_positions={max_pos}\n"
                             f"- order_id: {res.order_id}\n"
                         ),
                     )
                 else:
                     metrics["last_trade_action"] = f"BUY FAILED {symbol} ({exec_mode})"
                     metrics["last_trade_ts"] = now.timestamp()
-                    await context.application.bot.send_message(
-                        chat_id=owner,
-                        text=f"AUTO BUY FAILED\n- symbol: {symbol}\n- error: {res.error}",
-                    )
+                    await context.application.bot.send_message(chat_id=owner, text=f"AUTO BUY FAILED\n- symbol: {symbol}\n- error: {res.error}")
+                # Stop if we've filled the cap or reached max positions
+                open_notional2 = await asyncio.to_thread(total_open_notional, store, quote_cur)
+                if open_notional2 >= quote_cap - 1e-6:
+                    break
 
     # Evaluate trailing stops / reversal alerts for OPEN positions
     positions = await asyncio.to_thread(store.list_positions)

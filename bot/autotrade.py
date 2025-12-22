@@ -59,6 +59,7 @@ def decide_autobuy(
     quote_cap_total: float,
     quote_currency: str,
     min_trade_quote: float = 10.0,
+    max_positions: int = 3,
 ) -> AutoTradeDecision:
     """
     Risk rule:
@@ -70,16 +71,17 @@ def decide_autobuy(
     if any(p.symbol.upper() == symbol.upper() for p in positions):
         return AutoTradeDecision(action="SKIP", symbol=symbol, reason="position already open (same symbol)")
 
-    # Enforce single active position per quote currency (simple & safer).
-    if any(symbol_quote(p.symbol) == quote_currency.upper() for p in positions):
-        return AutoTradeDecision(action="SKIP", symbol=symbol, reason="another position already open (single-position mode)")
+    # Allow up to N open positions in the quote currency.
+    open_in_quote = [p for p in positions if symbol_quote(p.symbol) == quote_currency.upper()]
+    if len(open_in_quote) >= int(max_positions):
+        return AutoTradeDecision(action="SKIP", symbol=symbol, reason=f"max open positions reached ({max_positions})")
 
     open_notional = total_open_notional(store, quote_currency)
     remaining = max(0.0, float(quote_cap_total) - open_notional)
     if remaining < float(min_trade_quote):
         return AutoTradeDecision(action="SKIP", symbol=symbol, reason="cap reached / remaining too small")
 
-    return AutoTradeDecision(action="BUY", symbol=symbol, quote_amount=remaining, reason="buy (cap enforcement)")
+    return AutoTradeDecision(action="BUY", symbol=symbol, quote_amount=remaining, reason=f"buy (cap remaining {remaining:.2f})")
 
 
 def decide_autosell_all(symbol: str, reason: str) -> AutoTradeDecision:

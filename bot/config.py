@@ -129,10 +129,12 @@ def load_config() -> AppConfig:
     )
     recap_time = time(hour=20, minute=0, tzinfo=tz)
 
-    revolutx_base_url = (_env("REVOLUTX_BASE_URL", "https://api.revolut.com") or "").rstrip(
+    # Revolut X REST API doc examples use https://revx.revolut.com
+    revolutx_base_url = (_env("REVOLUTX_BASE_URL", "https://revx.revolut.com") or "").rstrip(
         "/"
     )
-    revolutx_base_path = (_env("REVOLUTX_BASE_PATH", "/revolutx") or "").rstrip("/")
+    # Paths in doc start with /api/..., so base path should usually be empty.
+    revolutx_base_path = (_env("REVOLUTX_BASE_PATH", "") or "").rstrip("/")
     revolutx_api_key = _env("REVOLUTX_API_KEY")
     revolutx_timeout_seconds = _env_int("REVOLUTX_TIMEOUT_SECONDS", 10)
 

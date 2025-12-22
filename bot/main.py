@@ -151,6 +151,8 @@ async def _build_status_text(context: ContextTypes.DEFAULT_TYPE) -> str:
     now = datetime.now(cfg.tz)
     within = is_within_operating_window(now, cfg.window_start, cfg.window_end)
     paused = bool(int(st.get("paused", 0)))
+    run_mode = (st.get("mode") or "session").lower()
+    effective_within = True if run_mode == "always" else within
 
     owner = await _get_owner_chat_id(context)
     positions = await asyncio.to_thread(store.list_positions)
@@ -174,7 +176,7 @@ async def _build_status_text(context: ContextTypes.DEFAULT_TYPE) -> str:
     why = []
     if paused:
         why.append("scanner in pausa")
-    if not within:
+    if run_mode != "always" and not within:
         why.append("fuori 09:00–20:00")
     if last_pairs_count in (0, None):
         why.append("pairs non disponibili (endpoint/parsing)")
@@ -192,7 +194,7 @@ async def _build_status_text(context: ContextTypes.DEFAULT_TYPE) -> str:
         f"- ora: {now.isoformat(timespec='seconds')}\n"
         f"- owner chat_id: {owner}\n"
         f"- paused: {paused}\n"
-        f"- finestra: {'OK' if within else 'NO'} (09:00–20:00 {cfg.tz_name})\n"
+        f"- finestra: {'OK' if effective_within else 'NO'} (09:00–20:00 {cfg.tz_name})\n"
         f"- risk: {risk.name} (mom_1h≥{fmt_pct(risk.mom_1h_threshold)}, mom_15m≥{fmt_pct(risk.mom_15m_threshold)}, trailing={fmt_pct(risk.trailing_stop_pct)})\n"
         "\n"
         "SCANNER\n"
@@ -1111,7 +1113,10 @@ async def status_ping_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     owner = await _get_owner_chat_id(context)
     if owner is None:
         return
-    always = os.getenv("STATUS_PING_ALWAYS", "0") == "1"
+    store: Storage = context.application.bot_data["store"]
+    st = await asyncio.to_thread(store.get_settings)
+    run_mode = (st.get("mode") or "session").lower()
+    always = os.getenv("STATUS_PING_ALWAYS", "0") == "1" or run_mode == "always" or int(st.get("autotrade_enabled", 0)) == 1
     now = datetime.now(cfg.tz)
     if not always and not is_within_operating_window(now, cfg.window_start, cfg.window_end):
         return

@@ -135,9 +135,90 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"- Risk: `{risk.name}` (mom_1h≥{fmt_pct(risk.mom_1h_threshold)}, mom_15m≥{fmt_pct(risk.mom_15m_threshold)}, trailing={fmt_pct(risk.trailing_stop_pct)})\n"
         f"- Base currency: `{st['base_currency']}`\n"
         f"- Starting capital: `{st['starting_capital']}`\n\n"
-        "Comandi: /setcapital, /setrisk, /buy, /sell, /portfolio, /config, /pause, /resume, /reset\n"
+        "Comandi: /status, /setcapital, /setrisk, /buy, /sell, /portfolio, /config, /pause, /resume, /reset\n"
     ).format(hard_min=cfg.hard_close_time.minute)
     await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+
+
+async def _build_status_text(context: ContextTypes.DEFAULT_TYPE) -> str:
+    cfg: AppConfig = context.application.bot_data["cfg"]
+    store: Storage = context.application.bot_data["store"]
+    st = await asyncio.to_thread(store.get_settings)
+    risk = RISK_PROFILES.get(st["risk_mode"], RISK_PROFILES["aggressive"])
+
+    now = datetime.now(cfg.tz)
+    within = is_within_operating_window(now, cfg.window_start, cfg.window_end)
+    paused = bool(int(st.get("paused", 0)))
+
+    owner = await _get_owner_chat_id(context)
+    positions = await asyncio.to_thread(store.list_positions)
+
+    metrics: dict[str, Any] = context.application.bot_data.setdefault("metrics", {})
+    scans_ok = int(metrics.get("scans_ok", 0))
+    scans_err = int(metrics.get("scans_err", 0))
+    signals_sent = int(metrics.get("signals_sent", 0))
+
+    def _fmt_ts(v: Any) -> str:
+        if not v:
+            return "n/a"
+        try:
+            return datetime.fromtimestamp(float(v), tz=cfg.tz).isoformat(timespec="seconds")
+        except Exception:
+            return "n/a"
+
+    last_pairs_count = metrics.get("last_pairs_count")
+    why = []
+    if paused:
+        why.append("scanner in pausa")
+    if not within:
+        why.append("fuori 09:00–20:00")
+    if last_pairs_count in (0, None):
+        why.append("pairs non disponibili (endpoint/parsing)")
+    if not why:
+        why.append("nessun segnale (soglie non raggiunte)")
+
+    base_url = st.get("revolutx_base_url") or cfg.revolutx_base_url
+    base_path = st.get("revolutx_base_path") or cfg.revolutx_base_path
+
+    text = (
+        "*Status bot*\n"
+        f"- ora: `{now.isoformat(timespec='seconds')}`\n"
+        f"- owner chat_id: `{owner}`\n"
+        f"- paused: `{paused}`\n"
+        f"- finestra: `{'OK' if within else 'NO'}` (09:00–20:00 {cfg.tz_name})\n"
+        f"- risk: `{risk.name}` (mom_1h≥{fmt_pct(risk.mom_1h_threshold)}, mom_15m≥{fmt_pct(risk.mom_15m_threshold)}, trailing={fmt_pct(risk.trailing_stop_pct)})\n\n"
+        "*Scanner*\n"
+        f"- last scan started: `{_fmt_ts(metrics.get('last_scan_started'))}`\n"
+        f"- last scan completed: `{_fmt_ts(metrics.get('last_scan_completed'))}`\n"
+        f"- last pairs count: `{last_pairs_count if last_pairs_count is not None else 'n/a'}`\n"
+        f"- scans ok/err: `{scans_ok}/{scans_err}`\n"
+        f"- last scan note: `{metrics.get('last_scan_note') or 'n/a'}`\n\n"
+        "*Notifiche*\n"
+        f"- signals sent (runtime): `{signals_sent}`\n"
+        f"- last signal: `{_fmt_ts(metrics.get('last_signal_ts'))}`\n"
+        f"- perché potresti non riceverne: `{'; '.join(why)}`\n\n"
+        "*Portfolio (manuale)*\n"
+        f"- posizioni aperte: `{len(positions)}`\n\n"
+        "*Revolut X*\n"
+        f"- base_url: `{base_url}`\n"
+        f"- base_path: `{base_path}`\n"
+        f"- api_key presente: `{bool(cfg.revolutx_api_key)}`\n"
+    )
+    last_error = metrics.get("last_error")
+    if last_error:
+        text += f"\n*Ultimo errore*\n`{str(last_error)[:400]}`\n"
+    return text
+
+
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    cfg: AppConfig = context.application.bot_data["cfg"]
+    if not _authorized(cfg, update):
+        return
+    owner = await _get_owner_chat_id(context)
+    chat = update.effective_chat
+    if owner is not None and chat and chat.id != owner:
+        return
+    await update.message.reply_text(await _build_status_text(context), parse_mode=ParseMode.MARKDOWN)
 
 
 async def cmd_config(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -722,9 +803,24 @@ async def scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         context.application.bot_data["rx"] = client
 
+    metrics: dict[str, Any] = context.application.bot_data.setdefault("metrics", {})
+    metrics["last_scan_started"] = now.timestamp()
+
     # Load pairs (read-only). If endpoint mismatch, it'll return [] and we just skip.
-    pairs = await asyncio.to_thread(client.get_pairs)
+    try:
+        pairs = await asyncio.to_thread(client.get_pairs)
+    except Exception as e:
+        metrics["scans_err"] = int(metrics.get("scans_err", 0)) + 1
+        metrics["last_error"] = f"get_pairs error: {repr(e)}"
+        metrics["last_scan_note"] = "get_pairs exception"
+        metrics["last_scan_completed"] = datetime.now(cfg.tz).timestamp()
+        return
+
+    metrics["last_pairs_count"] = len(pairs) if pairs is not None else None
     if not pairs:
+        metrics["scans_ok"] = int(metrics.get("scans_ok", 0)) + 1
+        metrics["last_scan_note"] = "get_pairs returned empty"
+        metrics["last_scan_completed"] = datetime.now(cfg.tz).timestamp()
         return
     pairs_limit = int(st.get("pairs_limit", cfg.pairs_limit))
     pairs = pairs[:pairs_limit]
@@ -733,34 +829,45 @@ async def scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     last_mom15_sign: dict[str, int] = context.application.bot_data.setdefault("last_mom15_sign", {})
 
     # Scan momentum for candidate BUY signals
-    for symbol in pairs:
-        candles = await asyncio.to_thread(client.get_candles, symbol, "5m", None, None, 13)
-        sig = compute_momentum_from_5m_candles(symbol, candles)
-        if not sig:
-            continue
+    try:
+        for symbol in pairs:
+            candles = await asyncio.to_thread(client.get_candles, symbol, "5m", None, None, 13)
+            sig = compute_momentum_from_5m_candles(symbol, candles)
+            if not sig:
+                continue
 
-        if sig.mom_1h >= risk.mom_1h_threshold and sig.mom_15m >= risk.mom_15m_threshold:
-            now_ts = now.timestamp()
-            last_ts = float(last_signal_by_symbol.get(symbol, 0.0))
-            if now_ts - last_ts >= cfg.signal_cooldown_seconds:
-                last_signal_by_symbol[symbol] = now_ts
-                text = (
-                    "*CANDIDATE BUY*\n"
-                    f"- symbol: `{symbol}`\n"
-                    f"- price: `{sig.last_price:.8g}`\n"
-                    f"- momentum 1h: `{fmt_pct(sig.mom_1h)}`\n"
-                    f"- momentum 15m: `{fmt_pct(sig.mom_15m)}`\n\n"
-                    "_È un segnale quantitativo (non certezza). Usa stop aggressivi e ricorda: chiudi entro le 20:00._"
-                )
-                await context.application.bot.send_message(
-                    chat_id=(await _get_owner_chat_id(context)) or 0,
-                    text=text,
-                    parse_mode=ParseMode.MARKDOWN,
-                )
+            if sig.mom_1h >= risk.mom_1h_threshold and sig.mom_15m >= risk.mom_15m_threshold:
+                now_ts = now.timestamp()
+                last_ts = float(last_signal_by_symbol.get(symbol, 0.0))
+                if now_ts - last_ts >= cfg.signal_cooldown_seconds:
+                    last_signal_by_symbol[symbol] = now_ts
+                    text = (
+                        "*CANDIDATE BUY*\n"
+                        f"- symbol: `{symbol}`\n"
+                        f"- price: `{sig.last_price:.8g}`\n"
+                        f"- momentum 1h: `{fmt_pct(sig.mom_1h)}`\n"
+                        f"- momentum 15m: `{fmt_pct(sig.mom_15m)}`\n\n"
+                        "_È un segnale quantitativo (non certezza). Usa stop aggressivi e ricorda: chiudi entro le 20:00._"
+                    )
+                    owner = await _get_owner_chat_id(context)
+                    if owner is not None:
+                        await context.application.bot.send_message(
+                            chat_id=owner,
+                            text=text,
+                            parse_mode=ParseMode.MARKDOWN,
+                        )
+                        metrics["signals_sent"] = int(metrics.get("signals_sent", 0)) + 1
+                        metrics["last_signal_ts"] = now_ts
 
-        # Track sign of mom_15m (for reversal alerts on open positions)
-        mom_sign = 1 if sig.mom_15m > 0 else (-1 if sig.mom_15m < 0 else 0)
-        last_mom15_sign[symbol] = mom_sign
+            # Track sign of mom_15m (for reversal alerts on open positions)
+            mom_sign = 1 if sig.mom_15m > 0 else (-1 if sig.mom_15m < 0 else 0)
+            last_mom15_sign[symbol] = mom_sign
+    except Exception as e:
+        metrics["scans_err"] = int(metrics.get("scans_err", 0)) + 1
+        metrics["last_error"] = f"scan loop error: {repr(e)}"
+        metrics["last_scan_note"] = "scan loop exception"
+        metrics["last_scan_completed"] = datetime.now(cfg.tz).timestamp()
+        return
 
     # Evaluate trailing stops / reversal alerts for OPEN positions
     positions = await asyncio.to_thread(store.list_positions)
@@ -778,8 +885,11 @@ async def scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 
         # Trailing stop alert
         if last_price <= peak * (1.0 - risk.trailing_stop_pct):
+            owner = await _get_owner_chat_id(context)
+            if owner is None:
+                continue
             await context.application.bot.send_message(
-                chat_id=(await _get_owner_chat_id(context)) or 0,
+                chat_id=owner,
                 text=(
                     "*EXIT ALERT (trailing stop)*\n"
                     f"- symbol: `{p.symbol}`\n"
@@ -799,8 +909,11 @@ async def scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             cur = 1 if sig.mom_15m > 0 else (-1 if sig.mom_15m < 0 else 0)
             last_mom15_sign[p.symbol] = cur
             if prev > 0 and cur < 0:
+                owner = await _get_owner_chat_id(context)
+                if owner is None:
+                    continue
                 await context.application.bot.send_message(
-                    chat_id=(await _get_owner_chat_id(context)) or 0,
+                    chat_id=owner,
                     text=(
                         "*EXIT ALERT (reversal 15m)*\n"
                         f"- symbol: `{p.symbol}`\n"
@@ -809,6 +922,22 @@ async def scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                     ),
                     parse_mode=ParseMode.MARKDOWN,
                 )
+
+    metrics["scans_ok"] = int(metrics.get("scans_ok", 0)) + 1
+    metrics["last_scan_note"] = "scan completed"
+    metrics["last_scan_completed"] = datetime.now(cfg.tz).timestamp()
+
+
+async def status_ping_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    cfg: AppConfig = context.application.bot_data["cfg"]
+    owner = await _get_owner_chat_id(context)
+    if owner is None:
+        return
+    always = os.getenv("STATUS_PING_ALWAYS", "0") == "1"
+    now = datetime.now(cfg.tz)
+    if not always and not is_within_operating_window(now, cfg.window_start, cfg.window_end):
+        return
+    await context.application.bot.send_message(chat_id=owner, text=await _build_status_text(context), parse_mode=ParseMode.MARKDOWN)
 
 
 async def hard_close_job(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -906,6 +1035,7 @@ def build_app(cfg: AppConfig) -> Application:
     app.bot_data["rx"] = rx
     app.bot_data["last_signal_by_symbol"] = {}
     app.bot_data["last_mom15_sign"] = {}
+    app.bot_data["metrics"] = {}
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("config", cmd_config))
@@ -916,6 +1046,7 @@ def build_app(cfg: AppConfig) -> Application:
     app.add_handler(CommandHandler("buy", cmd_buy))
     app.add_handler(CommandHandler("sell", cmd_sell))
     app.add_handler(CommandHandler("portfolio", cmd_portfolio))
+    app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("reset", cmd_reset))
     app.add_handler(CommandHandler("setup", cmd_setup))
     app.add_handler(CallbackQueryHandler(on_reset_callback, pattern=f"^{RESET_CONFIRM_CB}$|^{RESET_CANCEL_CB}$"))
@@ -930,6 +1061,13 @@ def build_app(cfg: AppConfig) -> Application:
     jq.run_repeating(scan_job, interval=scan_interval, first=5, name="scan")
     jq.run_daily(hard_close_job, time=hard_close_time, name="hard_close")
     jq.run_daily(recap_job, time=cfg.recap_time, name="recap")
+    status_every_minutes = int(os.getenv("STATUS_PING_MINUTES", "30") or "30")
+    jq.run_repeating(
+        status_ping_job,
+        interval=max(60, status_every_minutes * 60),
+        first=15,
+        name="status_ping",
+    )
 
     return app
 

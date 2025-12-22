@@ -46,6 +46,8 @@ Consigliate:
 - `SIGNAL_COOLDOWN_SECONDS` (default `1800`)
 - `HARD_CLOSE_MINUTE` (default `55`, quindi 19:55)
 - `DB_PATH` (default `bot.db`)
+- `STATUS_PING_MINUTES` (default `30`) → recap “stato bot” periodico
+- `STATUS_PING_ALWAYS` (default `0`) → se `1` manda lo status anche fuori 09:00–20:00
 - `ENABLE_WEB_SETUP` (default `0`) → se `1` avvia il wizard web
 - `SETUP_ADMIN_TOKEN` (obbligatorio se `ENABLE_WEB_SETUP=1`) → token admin per proteggere la pagina
 - `WEB_PORT` (default `8080`, su alcuni provider usa `PORT`)
@@ -69,6 +71,7 @@ Se i segnali non arrivano o `get_pairs()` restituisce lista vuota, quasi certame
 
 - `/start` stato rapido
 - `/setup` setup guidato (stile “registration page” in chat)
+- `/status` stato e diagnostica (scanner/ultimi scan/notifiche)
 - `/setcapital 100 EUR`
 - `/setrisk aggressive|normal|conservative`
 - `/buy BTC-EUR 20 at 43000`

@@ -146,10 +146,8 @@ async def _build_status_text(context: ContextTypes.DEFAULT_TYPE) -> str:
     risk = RISK_PROFILES.get(st["risk_mode"], RISK_PROFILES["aggressive"])
 
     now = datetime.now(cfg.tz)
-    within = is_within_operating_window(now, cfg.window_start, cfg.window_end)
     paused = bool(int(st.get("paused", 0)))
     run_mode = (st.get("mode") or "session").lower()
-    effective_within = True if run_mode == "always" else within
 
     owner = await _get_owner_chat_id(context)
     positions = await asyncio.to_thread(store.list_positions)
@@ -173,8 +171,6 @@ async def _build_status_text(context: ContextTypes.DEFAULT_TYPE) -> str:
     why = []
     if paused:
         why.append("scanner in pausa")
-    if run_mode != "always" and not within:
-        why.append("fuori 09:00–20:00")
     if last_pairs_count in (0, None):
         why.append("pairs non disponibili (endpoint/parsing)")
     if not why:
@@ -191,7 +187,7 @@ async def _build_status_text(context: ContextTypes.DEFAULT_TYPE) -> str:
         f"- ora: {now.isoformat(timespec='seconds')}\n"
         f"- owner chat_id: {owner}\n"
         f"- paused: {paused}\n"
-        f"- finestra: {'OK' if effective_within else 'NO'} (09:00–20:00 {cfg.tz_name})\n"
+        f"- mode: {run_mode} (always=24/7)\n"
         f"- risk: {risk.name} (mom_1h≥{fmt_pct(risk.mom_1h_threshold)}, mom_15m≥{fmt_pct(risk.mom_15m_threshold)}, trailing={fmt_pct(risk.trailing_stop_pct)})\n"
         "\n"
         "SCANNER\n"
@@ -223,7 +219,6 @@ async def _build_status_text(context: ContextTypes.DEFAULT_TYPE) -> str:
         f"- enabled: {bool(int(st.get('autotrade_enabled', 0)))}\n"
         f"- mode: {st.get('autotrade_mode', 'paper')}\n"
         f"- cap: {st.get('autotrade_max_quote', 100.0)} {st.get('autotrade_quote_currency', 'USDT')}\n"
-        f"- run mode: {st.get('mode', 'session')} (session=09-20, always=24/7)\n"
     )
     last_error = metrics.get("last_error")
     if last_error:

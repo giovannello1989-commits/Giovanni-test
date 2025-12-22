@@ -245,6 +245,45 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
     await update.message.reply_text(await _build_status_text(context))
 
+async def cmd_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    cfg: AppConfig = context.application.bot_data["cfg"]
+    if not _authorized(cfg, update):
+        return
+    owner = await _get_owner_chat_id(context)
+    chat = update.effective_chat
+    if owner is not None and chat and chat.id != owner:
+        return
+    rx: RevolutXClient = context.application.bot_data["rx"]
+    data = await asyncio.to_thread(rx.get_balances)
+    if not isinstance(data, list):
+        await update.message.reply_text("Wallet: non disponibile (balances non è una lista).")
+        return
+    # Show main currencies first
+    wanted = ["USDT", "USD", "EUR", "BTC", "ETH", "SOL"]
+    by_cur = {str(r.get("currency", "")).upper(): r for r in data if isinstance(r, dict)}
+    lines = ["WALLET (Revolut X)"]
+    for cur in wanted:
+        r = by_cur.get(cur)
+        if not r:
+            continue
+        lines.append(f"- {cur}: available={r.get('available')} reserved={r.get('reserved')}")
+    # Show a few more non-zero
+    extra = []
+    for cur, r in by_cur.items():
+        if cur in wanted:
+            continue
+        try:
+            av = float(r.get("available") or 0)
+        except Exception:
+            continue
+        if av <= 0:
+            continue
+        extra.append((av, cur))
+    extra.sort(reverse=True)
+    for av, cur in extra[:10]:
+        lines.append(f"- {cur}: available={by_cur[cur].get('available')} reserved={by_cur[cur].get('reserved')}")
+    await update.message.reply_text("\n".join(lines))
+
 
 async def cmd_revxprobe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
@@ -1194,6 +1233,48 @@ async def status_ping_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     await context.application.bot.send_message(chat_id=owner, text=await _build_status_text(context))
 
+async def hourly_report_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Hourly operational report: wallet snapshot + open positions + last actions.
+    """
+    cfg: AppConfig = context.application.bot_data["cfg"]
+    owner = await _get_owner_chat_id(context)
+    if owner is None:
+        return
+    store: Storage = context.application.bot_data["store"]
+    st = await asyncio.to_thread(store.get_settings)
+    if int(st.get("autotrade_enabled", 0)) != 1 and (st.get("mode") or "session") != "always":
+        return
+    rx: RevolutXClient = context.application.bot_data["rx"]
+    balances = await asyncio.to_thread(rx.get_balances)
+    md: MarketDataClient = context.application.bot_data["md"]
+    positions = await asyncio.to_thread(store.list_positions)
+    metrics: dict[str, Any] = context.application.bot_data.setdefault("metrics", {})
+
+    lines = ["REPORT ORARIO"]
+    lines.append(f"- ora: {datetime.now(cfg.tz).isoformat(timespec='seconds')}")
+    lines.append(f"- autotrade: {bool(int(st.get('autotrade_enabled',0)))} mode={st.get('autotrade_mode','paper')} cap={st.get('autotrade_max_quote')} {st.get('autotrade_quote_currency')}")
+    lines.append(f"- last action: {metrics.get('last_trade_action','n/a')}")
+    if isinstance(balances, list):
+        by_cur = {str(r.get('currency','')).upper(): r for r in balances if isinstance(r, dict)}
+        for cur in ["USDT", "USD"]:
+            if cur in by_cur:
+                lines.append(f"- wallet {cur}: available={by_cur[cur].get('available')} reserved={by_cur[cur].get('reserved')}")
+    # Positions + PnL snapshot
+    if not positions:
+        lines.append("- posizioni aperte: 0")
+    else:
+        lines.append(f"- posizioni aperte: {len(positions)}")
+        for p in positions[:10]:
+            last = await asyncio.to_thread(md.get_last_price, p.symbol)
+            if last is None:
+                lines.append(f"  - {p.symbol}: qty={p.qty:.6g} entry={p.avg_entry:.6g} (last n/a)")
+                continue
+            pnl = (last - p.avg_entry) * p.qty
+            pct = ((last - p.avg_entry) / p.avg_entry) * 100 if p.avg_entry else 0.0
+            lines.append(f"  - {p.symbol}: qty={p.qty:.6g} entry={p.avg_entry:.6g} last={last:.6g} pnl≈{pnl:+.2f} ({pct:+.2f}%)")
+    await context.application.bot.send_message(chat_id=owner, text="\n".join(lines))
+
 
 async def hard_close_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     cfg: AppConfig = context.application.bot_data["cfg"]
@@ -1334,6 +1415,7 @@ def build_app(cfg: AppConfig) -> Application:
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("revxprobe", cmd_revxprobe))
     app.add_handler(CommandHandler("revxpub", cmd_revxpub))
+    app.add_handler(CommandHandler("wallet", cmd_wallet))
     app.add_handler(CommandHandler("setmode", cmd_setmode))
     app.add_handler(CommandHandler("autotrade", cmd_autotrade))
     app.add_handler(CommandHandler("reset", cmd_reset))
@@ -1357,6 +1439,7 @@ def build_app(cfg: AppConfig) -> Application:
         first=15,
         name="status_ping",
     )
+    jq.run_repeating(hourly_report_job, interval=3600, first=60, name="hourly_report")
 
     return app
 

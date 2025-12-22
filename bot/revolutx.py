@@ -35,15 +35,10 @@ class RevolutXEndpoints:
     #
     # Keep these centralized so you can update them quickly.
     #
-    # Configuration endpoints (from doc):
-    # - GET /api/1.0/configuration/currencies
-    # - GET /api/1.0/configuration/currency-pairs
-    config_currencies: str = "/api/1.0/configuration/currencies"
-    config_currency_pairs: str = "/api/1.0/configuration/currency-pairs"
-
     # --- Configuration (documented) ---
-    config_currencies: str = "/api/1.0/configuration/currencies"  # confirmed 200 in your account
-    # NOTE: some accounts expose a different currency-pairs path. We'll probe multiple candidates in code.
+    # - GET /api/1.0/configuration/currencies (confirmed 200 in your account)
+    # - GET /api/1.0/configuration/currency-pairs (may vary; we probe alternatives in code)
+    config_currencies: str = "/api/1.0/configuration/currencies"
     config_currency_pairs: str = "/api/1.0/configuration/currency-pairs"
 
     # --- Public market data (documented) ---

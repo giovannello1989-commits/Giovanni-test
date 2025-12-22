@@ -444,6 +444,29 @@ async def cmd_autotrade(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     await update.message.reply_text("Comando non riconosciuto. Usa: on|off|mode|cap")
 
+async def cmd_bootstrap(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Force the "startup defaults" without relying on bootstrapped flag.
+    Useful when the DB was reset or migrated and you want to restart quickly.
+    """
+    cfg: AppConfig = context.application.bot_data["cfg"]
+    if not _authorized(cfg, update):
+        return
+    owner = await _get_owner_chat_id(context)
+    chat = update.effective_chat
+    if owner is not None and chat and chat.id != owner:
+        return
+    store: Storage = context.application.bot_data["store"]
+    await asyncio.to_thread(
+        store.update_settings,
+        risk_mode="normal",
+        autotrade_enabled=1,
+        mode="always",
+        paused=0,
+        bootstrapped=1,
+    )
+    await update.message.reply_text("OK. Bootstrap applicato: risk=normal, mode=always, autotrade=ON, scanner=ON.")
+
 
 async def cmd_config(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     cfg: AppConfig = context.application.bot_data["cfg"]
@@ -1458,6 +1481,7 @@ def build_app(cfg: AppConfig) -> Application:
     app.add_handler(CommandHandler("wallet", cmd_wallet))
     app.add_handler(CommandHandler("setmode", cmd_setmode))
     app.add_handler(CommandHandler("autotrade", cmd_autotrade))
+    app.add_handler(CommandHandler("bootstrap", cmd_bootstrap))
     app.add_handler(CommandHandler("reset", cmd_reset))
     app.add_handler(CommandHandler("setup", cmd_setup))
     app.add_handler(CallbackQueryHandler(on_reset_callback, pattern=f"^{RESET_CONFIRM_CB}$|^{RESET_CANCEL_CB}$"))

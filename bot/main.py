@@ -1201,6 +1201,9 @@ async def scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         metrics["last_scan_note"] = "scan running"
 
         try:
+            # Let ENV override DB for scan sizing (Railway-friendly).
+            pairs_limit_cfg = int(_parse_float(os.getenv("PAIRS_LIMIT", str(st.get("pairs_limit", cfg.pairs_limit))) or str(st.get("pairs_limit", cfg.pairs_limit))) or st.get("pairs_limit", cfg.pairs_limit))
+
             # Load pairs from market data provider.
             # If provider is Binance, we can optionally scan only "top movers" to find more opportunities.
             # Default to high-liquidity universe (more overlap with Revolut X).
@@ -1243,13 +1246,13 @@ async def scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                         # If we couldn't fetch symbols, don't get stuck scanning alphabetic Binance list.
                         # Fall back to top-volume majors (still filtered later by Revolut tradability).
                         if hasattr(md, "get_top_volume"):
-                            pairs = await asyncio.to_thread(getattr(md, "get_top_volume"), int(st.get("pairs_limit", cfg.pairs_limit)))
+                            pairs = await asyncio.to_thread(getattr(md, "get_top_volume"), pairs_limit_cfg)
                             metrics["scan_universe"] = "topvolume(fallback)"
                 if scan_universe == "topmovers" and hasattr(md, "get_top_movers"):
-                    pairs = await asyncio.to_thread(getattr(md, "get_top_movers"), int(st.get("pairs_limit", cfg.pairs_limit)))
+                    pairs = await asyncio.to_thread(getattr(md, "get_top_movers"), pairs_limit_cfg)
                     metrics["scan_universe"] = "topmovers"
                 if scan_universe == "topvolume" and hasattr(md, "get_top_volume"):
-                    pairs = await asyncio.to_thread(getattr(md, "get_top_volume"), int(st.get("pairs_limit", cfg.pairs_limit)))
+                    pairs = await asyncio.to_thread(getattr(md, "get_top_volume"), pairs_limit_cfg)
                     metrics["scan_universe"] = "topvolume"
                 if not pairs:
                     pairs = await asyncio.to_thread(md.get_pairs)
@@ -1267,7 +1270,7 @@ async def scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                 metrics["last_scan_note"] = "get_pairs returned empty"
                 metrics["last_scan_completed"] = datetime.now(cfg.tz).timestamp()
                 return
-            pairs_limit = int(st.get("pairs_limit", cfg.pairs_limit))
+            pairs_limit = int(pairs_limit_cfg)
             pairs = pairs[:pairs_limit]
 
             last_signal_by_symbol: dict[str, float] = context.application.bot_data.setdefault("last_signal_by_symbol", {})
@@ -1591,7 +1594,8 @@ async def scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                         else:
                             metrics["last_trade_action"] = f"BUY FAILED {symbol} ({exec_mode})"
                             metrics["last_trade_ts"] = now.timestamp()
-                            await context.application.bot.send_message(chat_id=owner, text=f"AUTO BUY FAILED\n- symbol: {symbol}\n- error: {res.error}")
+                    metrics["last_error"] = f"last trade error: {res.error}"
+                    await context.application.bot.send_message(chat_id=owner, text=f"AUTO BUY FAILED\n- symbol: {symbol}\n- error: {res.error}")
                         # Stop if we've filled the cap or reached max positions
                         open_notional2 = await asyncio.to_thread(total_open_notional, store, q)
                         if open_notional2 >= quote_cap - 1e-6:

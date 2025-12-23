@@ -434,7 +434,9 @@ class RevolutXClient:
         data = self._public_get_json(self.endpoints.public_last_trades)
         # Some deployments require signature even on "public" endpoints.
         if data is None and self.auth_ready():
-            data = self._request_json("GET", self.endpoints.public_last_trades)
+            status, payload = self._request("GET", self.endpoints.public_last_trades, retries=0)
+            if status == 200:
+                data = payload
         items: list[Any] = []
         if isinstance(data, dict) and isinstance(data.get("data"), list):
             items = data["data"]

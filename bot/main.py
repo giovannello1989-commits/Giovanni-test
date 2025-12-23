@@ -138,6 +138,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "autotrade_mode": default_autotrade_mode,
         "entry_strategy": (os.getenv("AUTO_DEFAULTS_ENTRY_STRATEGY", "ranked") or "ranked").lower().strip(),
         "autotrade_cap_mode": (os.getenv("AUTO_DEFAULTS_CAP_MODE", "compound") or "compound").lower().strip(),
+        # Default budget & quote currency (your setup: 100 USDC)
+        "autotrade_max_quote": float(_parse_float(os.getenv("AUTO_DEFAULTS_CAP_AMT", "100") or "100") or 100.0),
+        "autotrade_quote_currency": (os.getenv("AUTO_DEFAULTS_CAP_CUR", "USDC") or "USDC").upper().strip(),
         "mode": "always",
         "paused": 0,
         "bootstrapped": 1,

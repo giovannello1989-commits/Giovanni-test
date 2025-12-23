@@ -373,6 +373,40 @@ async def cmd_egressip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.message.reply_text(f"Egress IP (public): {ip}\n\nNota: su Railway l'IP può cambiare.")
 
 
+async def egress_ip_report_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Periodic egress IP report to help with Revolut X IP whitelist.
+    Default every 12 hours (configurable via ENV).
+    """
+    cfg: AppConfig = context.application.bot_data["cfg"]
+    owner = await _get_owner_chat_id(context)
+    if owner is None:
+        return
+
+    def _fetch_ip() -> str:
+        try:
+            with urllib.request.urlopen("https://api.ipify.org", timeout=10) as r:
+                return r.read().decode("utf-8").strip()
+        except Exception as e:
+            return f"error: {repr(e)}"
+
+    ip = await asyncio.to_thread(_fetch_ip)
+    bot_data = context.application.bot_data
+    prev = bot_data.get("last_egress_ip")
+    bot_data["last_egress_ip"] = ip
+    changed = (prev is not None and prev != ip)
+
+    msg = "EGRESS IP REPORT\n" f"- ora: {datetime.now(cfg.tz).isoformat(timespec='seconds')}\n" f"- ip: {ip}\n"
+    if prev is None:
+        msg += "- changed: n/a (first report)\n"
+    else:
+        msg += f"- changed: {changed}\n"
+        if changed:
+            msg += f"- prev: {prev}\n"
+    msg += "\nNota: se usi whitelist IP su Revolut X e l'IP cambia, aggiorna la whitelist."
+    await context.application.bot.send_message(chat_id=owner, text=msg)
+
+
 async def cmd_revxprobe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Probes common Revolut X REST API paths (read-only) to discover correct endpoints.
@@ -2155,6 +2189,15 @@ def build_app(cfg: AppConfig) -> Application:
         name="status_ping",
     )
     jq.run_repeating(hourly_report_job, interval=3600, first=60, name="hourly_report")
+
+    # Egress IP report (default: every 12 hours)
+    egress_hours = int(_parse_float(os.getenv("EGRESS_IP_REPORT_HOURS", "12") or "12") or 12)
+    jq.run_repeating(
+        egress_ip_report_job,
+        interval=max(3600, egress_hours * 3600),
+        first=30,
+        name="egress_ip_report",
+    )
 
     return app
 

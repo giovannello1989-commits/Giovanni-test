@@ -218,6 +218,14 @@ async def _build_status_text(context: ContextTypes.DEFAULT_TYPE) -> str:
         why.append("scanner in pausa")
     if last_pairs_count in (0, None):
         why.append("pairs non disponibili (endpoint/parsing)")
+    # If we see momentum hits but no tradable hits, explain the real reason.
+    try:
+        mom_hits = int(metrics.get("scan_mom_hits", 0) or 0)
+        trad_hits = int(metrics.get("scan_tradable_hits", 0) or 0)
+        if mom_hits > 0 and trad_hits == 0:
+            why.append("segnali trovati ma nessuna coppia tradabile su Revolut X (quote/pairs mismatch)")
+    except Exception:
+        pass
     if not why:
         why.append("nessun segnale (soglie non raggiunte)")
 
@@ -269,6 +277,7 @@ async def _build_status_text(context: ContextTypes.DEFAULT_TYPE) -> str:
         f"- cap: {st.get('autotrade_max_quote', 100.0)} {st.get('autotrade_quote_currency', 'USDT')}\n"
         f"- cap_mode: {st.get('autotrade_cap_mode', 'fixed')}\n"
         f"- cap_effective (last scan): {metrics.get('cap_effective') if metrics.get('cap_effective') is not None else 'n/a'}\n"
+        f"- multi_quotes: {st.get('autotrade_quote_currencies') or 'n/a'}\n"
     )
     last_error = metrics.get("last_error")
     if last_error:

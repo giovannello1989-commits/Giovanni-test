@@ -24,7 +24,13 @@ from bot.autotrade import LiveRevolutXExecutor, PaperExecutor, decide_autobuy, t
 from bot.marketdata import MarketDataClient, create_market_data_client
 from bot.revolutx import RevolutXClient
 from bot.storage import Storage
-from bot.strategy import compute_momentum_from_5m_candles, fmt_pct
+from bot.strategy import (
+    EntrySignal,
+    compute_breakout_signal,
+    compute_dip_signal,
+    compute_momentum_from_5m_candles,
+    fmt_pct,
+)
 from bot.web import create_web_app
 
 
@@ -569,6 +575,26 @@ async def cmd_setrisk(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     )
 
 
+async def cmd_setentry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    cfg: AppConfig = context.application.bot_data["cfg"]
+    if not _authorized(cfg, update):
+        return
+    owner = await _get_owner_chat_id(context)
+    chat = update.effective_chat
+    if owner is not None and chat and chat.id != owner:
+        return
+    if not context.args:
+        await update.message.reply_text("Uso: `/setentry momentum|breakout|dip`", parse_mode=ParseMode.MARKDOWN)
+        return
+    mode = context.args[0].lower().strip()
+    if mode not in ("momentum", "breakout", "dip"):
+        await update.message.reply_text("Valore non valido. Usa: momentum|breakout|dip")
+        return
+    store: Storage = context.application.bot_data["store"]
+    await asyncio.to_thread(store.update_settings, entry_strategy=mode)
+    await update.message.reply_text(f"OK. entry_strategy={mode}.")
+
+
 def _parse_trade_cmd(args: list[str]) -> tuple[str, float, float] | None:
     """
     Expected:
@@ -1039,6 +1065,9 @@ async def scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             return
 
     risk = RISK_PROFILES.get(st["risk_mode"], RISK_PROFILES["aggressive"])
+    entry_strategy = (st.get("entry_strategy") or "momentum").lower()
+    breakout_pct = float(st.get("breakout_pct", 0.015))
+    dip_pct = float(st.get("dip_pct", 0.03))
     md: MarketDataClient = context.application.bot_data["md"]
     paper_exec: PaperExecutor = context.application.bot_data["paper_exec"]
     live_exec: LiveRevolutXExecutor = context.application.bot_data["live_exec"]
@@ -1099,11 +1128,32 @@ async def scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         for symbol in pairs:
             candles = await asyncio.to_thread(md.get_candles, symbol, "5m", 13)
-            sig = compute_momentum_from_5m_candles(symbol, candles)
-            if not sig:
+            mom = compute_momentum_from_5m_candles(symbol, candles)
+            if not mom:
                 continue
 
-            if sig.mom_1h >= risk.mom_1h_threshold and sig.mom_15m >= risk.mom_15m_threshold:
+            entry: EntrySignal | None = None
+            if entry_strategy == "momentum":
+                if mom.mom_1h >= risk.mom_1h_threshold and mom.mom_15m >= risk.mom_15m_threshold:
+                    entry = EntrySignal(
+                        kind="momentum",
+                        symbol=symbol,
+                        last_price=mom.last_price,
+                        mom_1h=mom.mom_1h,
+                        mom_15m=mom.mom_15m,
+                        reason=f"mom_1h {fmt_pct(mom.mom_1h)}≥{fmt_pct(risk.mom_1h_threshold)} AND mom_15m {fmt_pct(mom.mom_15m)}≥{fmt_pct(risk.mom_15m_threshold)}",
+                    )
+            elif entry_strategy == "breakout":
+                entry = compute_breakout_signal(symbol, candles, breakout_pct)
+                # keep mom for ranking if available
+                if entry and mom:
+                    entry = EntrySignal(kind=entry.kind, symbol=entry.symbol, last_price=entry.last_price, reason=entry.reason, mom_1h=mom.mom_1h, mom_15m=mom.mom_15m)
+            elif entry_strategy == "dip":
+                entry = compute_dip_signal(symbol, candles, dip_pct)
+                if entry and mom:
+                    entry = EntrySignal(kind=entry.kind, symbol=entry.symbol, last_price=entry.last_price, reason=entry.reason, mom_1h=mom.mom_1h, mom_15m=mom.mom_15m)
+
+            if entry:
                 # Collect candidates for auto-buy (we'll take top N)
                 revx_symbol = _map_to_revx_symbol(symbol)
                 if await _revx_pair_exists(revx_symbol):
@@ -1114,47 +1164,30 @@ async def scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                         last_signal_by_symbol[revx_symbol] = now_ts
                         owner = await _get_owner_chat_id(context)
                         if owner is not None:
+                            parts = [
+                                "*CANDIDATE BUY (tradable on Revolut X)*",
+                                f"- market symbol: `{symbol}` (source: {context.application.bot_data.get('md_provider','market')})",
+                                f"- revolut symbol: `{revx_symbol}`",
+                                f"- market price: `{entry.last_price:.8g}`",
+                                f"- strategy: `{entry.kind}`",
+                            ]
+                            if entry.mom_1h is not None:
+                                parts.append(f"- momentum 1h: `{fmt_pct(entry.mom_1h)}`")
+                            if entry.mom_15m is not None:
+                                parts.append(f"- momentum 15m: `{fmt_pct(entry.mom_15m)}`")
+                            parts.append(f"- cap totale: `{quote_cap:.2f} {quote_cur}`")
+                            parts.append("")
+                            parts.append(f"_Motivo: {entry.reason}_")
                             await context.application.bot.send_message(
                                 chat_id=owner,
-                                text=(
-                                    "*CANDIDATE BUY (tradable on Revolut X)*\n"
-                                    f"- market symbol: `{symbol}` (source: {context.application.bot_data.get('md_provider','market')})\n"
-                                    f"- revolut symbol: `{revx_symbol}`\n"
-                                    f"- market price: `{sig.last_price:.8g}`\n"
-                                    f"- momentum 1h: `{fmt_pct(sig.mom_1h)}`\n"
-                                    f"- momentum 15m: `{fmt_pct(sig.mom_15m)}`\n"
-                                    f"- cap totale: `{quote_cap:.2f} {quote_cur}`\n\n"
-                                    "_Segnale quantitativo: non è certezza._"
-                                ),
+                                text="\n".join(parts),
                                 parse_mode=ParseMode.MARKDOWN,
                             )
                             metrics["signals_sent"] = int(metrics.get("signals_sent", 0)) + 1
                             metrics["last_signal_ts"] = now_ts
 
                     if autotrade_on:
-                        candidates.append((revx_symbol, sig))
-
-                now_ts = now.timestamp()
-                last_ts = float(last_signal_by_symbol.get(symbol, 0.0))
-                if now_ts - last_ts >= cfg.signal_cooldown_seconds:
-                    last_signal_by_symbol[symbol] = now_ts
-                    text = (
-                        "*CANDIDATE BUY*\n"
-                        f"- symbol: `{symbol}`\n"
-                        f"- price: `{sig.last_price:.8g}`\n"
-                        f"- momentum 1h: `{fmt_pct(sig.mom_1h)}`\n"
-                        f"- momentum 15m: `{fmt_pct(sig.mom_15m)}`\n\n"
-                        "_È un segnale quantitativo (non certezza). Usa stop aggressivi e ricorda: chiudi entro le 20:00._"
-                    )
-                    owner = await _get_owner_chat_id(context)
-                    if owner is not None:
-                        await context.application.bot.send_message(
-                            chat_id=owner,
-                            text=text,
-                            parse_mode=ParseMode.MARKDOWN,
-                        )
-                        metrics["signals_sent"] = int(metrics.get("signals_sent", 0)) + 1
-                        metrics["last_signal_ts"] = now_ts
+                        candidates.append((revx_symbol, entry))
 
             # Track sign of mom_15m (for reversal alerts on open positions)
             mom_sign = 1 if sig.mom_15m > 0 else (-1 if sig.mom_15m < 0 else 0)
@@ -1169,10 +1202,14 @@ async def scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     # AUTO BUY: open up to max_pos positions, total exposure <= quote_cap.
     if autotrade_on and candidates:
         # Highest 15m momentum first
-        candidates.sort(key=lambda x: float(x[1].mom_15m), reverse=True)
+        # Prefer momentum ranking if available, otherwise keep stable order.
+        def _rank(item):
+            ent = item[1]
+            return float(ent.mom_15m) if getattr(ent, "mom_15m", None) is not None else 0.0
+        candidates.sort(key=_rank, reverse=True)
         owner = await _get_owner_chat_id(context)
         if owner is not None:
-            for symbol, sig in candidates:
+            for symbol, entry in candidates:
                 open_notional = await asyncio.to_thread(total_open_notional, store, quote_cur)
                 remaining = max(0.0, quote_cap - float(open_notional))
                 decision = decide_autobuy(
@@ -1199,7 +1236,9 @@ async def scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                             f"- symbol: {symbol}\n"
                             f"- spent: {spend:.2f} {quote_cur} (cap totale {quote_cap:.2f}, residuo pre-buy {remaining:.2f})\n"
                             f"- price: {res.fill_price if res.fill_price is not None else 'n/a'}\n"
-                            f"- motivo: mom_1h={fmt_pct(sig.mom_1h)}≥{fmt_pct(risk.mom_1h_threshold)} AND mom_15m={fmt_pct(sig.mom_15m)}≥{fmt_pct(risk.mom_15m_threshold)}; top mover 15m; max_positions={max_pos}; cap totale={quote_cap:.2f} {quote_cur}\n"
+                            f"- strategy: {entry.kind}\n"
+                            f"- motivo: {entry.reason}\n"
+                            f"- max_positions: {max_pos} cap totale={quote_cap:.2f} {quote_cur}\n"
                             f"- order_id: {res.order_id}\n"
                         ),
                     )
@@ -1520,6 +1559,7 @@ def build_app(cfg: AppConfig) -> Application:
     app.add_handler(CommandHandler("resume", cmd_resume))
     app.add_handler(CommandHandler("setcapital", cmd_setcapital))
     app.add_handler(CommandHandler("setrisk", cmd_setrisk))
+    app.add_handler(CommandHandler("setentry", cmd_setentry))
     app.add_handler(CommandHandler("buy", cmd_buy))
     app.add_handler(CommandHandler("sell", cmd_sell))
     app.add_handler(CommandHandler("portfolio", cmd_portfolio))

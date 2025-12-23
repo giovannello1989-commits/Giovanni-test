@@ -34,6 +34,13 @@ DEFAULT_SETTINGS = {
     "market_data_quote": "USDT",
     # Internal: if 0, /start will apply bootstrap defaults
     "bootstrapped": 0,
+    # Entry strategy (controls how often we enter)
+    # - momentum: current logic
+    # - breakout: 1h high breakout
+    # - dip: mean-reversion dip buy
+    "entry_strategy": "momentum",
+    "breakout_pct": 0.015,
+    "dip_pct": 0.03,
 }
 
 
@@ -161,6 +168,9 @@ class Storage:
             _ensure_col("market_data_provider", "market_data_provider TEXT NOT NULL DEFAULT 'binance'", DEFAULT_SETTINGS["market_data_provider"])
             _ensure_col("market_data_quote", "market_data_quote TEXT NOT NULL DEFAULT 'USDT'", DEFAULT_SETTINGS["market_data_quote"])
             _ensure_col("bootstrapped", "bootstrapped INTEGER NOT NULL DEFAULT 0", DEFAULT_SETTINGS["bootstrapped"])
+            _ensure_col("entry_strategy", "entry_strategy TEXT NOT NULL DEFAULT 'momentum'", DEFAULT_SETTINGS["entry_strategy"])
+            _ensure_col("breakout_pct", "breakout_pct REAL NOT NULL DEFAULT 0.015", DEFAULT_SETTINGS["breakout_pct"])
+            _ensure_col("dip_pct", "dip_pct REAL NOT NULL DEFAULT 0.03", DEFAULT_SETTINGS["dip_pct"])
 
             # Trades table migration for new columns
             trade_cols = [r["name"] for r in conn.execute("PRAGMA table_info(trades)").fetchall()]
@@ -202,6 +212,9 @@ class Storage:
             "market_data_provider",
             "market_data_quote",
             "bootstrapped",
+            "entry_strategy",
+            "breakout_pct",
+            "dip_pct",
         }
         fields = [(k, v) for k, v in kwargs.items() if k in allowed]
         if not fields:
@@ -231,7 +244,10 @@ class Storage:
                     autotrade_max_positions=?,
                     market_data_provider=?,
                     market_data_quote=?,
-                    bootstrapped=?
+                    bootstrapped=?,
+                    entry_strategy=?,
+                    breakout_pct=?,
+                    dip_pct=?
                 WHERE id=1
                 """,
                 (
@@ -253,6 +269,9 @@ class Storage:
                     DEFAULT_SETTINGS["market_data_provider"],
                     DEFAULT_SETTINGS["market_data_quote"],
                     DEFAULT_SETTINGS["bootstrapped"],
+                    DEFAULT_SETTINGS["entry_strategy"],
+                    DEFAULT_SETTINGS["breakout_pct"],
+                    DEFAULT_SETTINGS["dip_pct"],
                 ),
             )
 

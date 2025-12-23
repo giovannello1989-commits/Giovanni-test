@@ -167,11 +167,10 @@ class LiveRevolutXExecutor:
             if isinstance(data, dict) and data.get(k):
                 order_id = str(data[k])
                 break
-        px = None
-        if self.md:
+        # Record entry price using Revolut X last price for this exact symbol/quote.
+        px = self.rx.get_last_price(symbol)
+        if px is None and self.md:
             px = self.md.get_last_price(symbol)
-        if px is None:
-            px = self.rx.get_last_price(symbol)
         if px is not None:
             self.store.add_buy(
                 symbol=symbol,

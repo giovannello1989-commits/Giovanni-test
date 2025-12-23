@@ -1042,6 +1042,7 @@ async def scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     md: MarketDataClient = context.application.bot_data["md"]
     paper_exec: PaperExecutor = context.application.bot_data["paper_exec"]
     live_exec: LiveRevolutXExecutor = context.application.bot_data["live_exec"]
+    rx: RevolutXClient = context.application.bot_data["rx"]
 
     metrics: dict[str, Any] = context.application.bot_data.setdefault("metrics", {})
     metrics["last_scan_started"] = now.timestamp()
@@ -1076,6 +1077,24 @@ async def scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     executor = live_exec if exec_mode == "live" else paper_exec
     candidates: list[tuple[str, Any]] = []
 
+    # Cache for "is this tradable on Revolut X?" checks
+    pair_cache: dict[str, Any] = context.application.bot_data.setdefault("revx_pair_cache", {})
+    cache_ttl_seconds = int(os.getenv("REVX_PAIR_CACHE_TTL_SECONDS", "21600"))  # 6h
+
+    def _map_to_revx_symbol(market_symbol: str) -> str:
+        base = market_symbol.split("-")[0].upper()
+        return f"{base}-{quote_cur}"
+
+    async def _revx_pair_exists(symbol: str) -> bool:
+        now_ts = now.timestamp()
+        cached = pair_cache.get(symbol)
+        if cached and isinstance(cached, dict):
+            if (now_ts - float(cached.get("ts", 0))) < cache_ttl_seconds:
+                return bool(cached.get("ok", False))
+        ok = await asyncio.to_thread(rx.pair_exists_via_trades_private, symbol)
+        pair_cache[symbol] = {"ok": ok, "ts": now_ts}
+        return ok
+
     # Scan momentum for candidate BUY signals
     try:
         for symbol in pairs:
@@ -1086,8 +1105,34 @@ async def scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 
             if sig.mom_1h >= risk.mom_1h_threshold and sig.mom_15m >= risk.mom_15m_threshold:
                 # Collect candidates for auto-buy (we'll take top N)
-                if autotrade_on and symbol.endswith(f"-{quote_cur}"):
-                    candidates.append((symbol, sig))
+                revx_symbol = _map_to_revx_symbol(symbol)
+                if await _revx_pair_exists(revx_symbol):
+                    # send signal only if tradable on Revolut X
+                    now_ts = now.timestamp()
+                    last_ts = float(last_signal_by_symbol.get(revx_symbol, 0.0))
+                    if now_ts - last_ts >= cfg.signal_cooldown_seconds:
+                        last_signal_by_symbol[revx_symbol] = now_ts
+                        owner = await _get_owner_chat_id(context)
+                        if owner is not None:
+                            await context.application.bot.send_message(
+                                chat_id=owner,
+                                text=(
+                                    "*CANDIDATE BUY (tradable on Revolut X)*\n"
+                                    f"- market symbol: `{symbol}` (source: {context.application.bot_data.get('md_provider','market')})\n"
+                                    f"- revolut symbol: `{revx_symbol}`\n"
+                                    f"- market price: `{sig.last_price:.8g}`\n"
+                                    f"- momentum 1h: `{fmt_pct(sig.mom_1h)}`\n"
+                                    f"- momentum 15m: `{fmt_pct(sig.mom_15m)}`\n"
+                                    f"- cap totale: `{quote_cap:.2f} {quote_cur}`\n\n"
+                                    "_Segnale quantitativo: non è certezza._"
+                                ),
+                                parse_mode=ParseMode.MARKDOWN,
+                            )
+                            metrics["signals_sent"] = int(metrics.get("signals_sent", 0)) + 1
+                            metrics["last_signal_ts"] = now_ts
+
+                    if autotrade_on:
+                        candidates.append((revx_symbol, sig))
 
                 now_ts = now.timestamp()
                 last_ts = float(last_signal_by_symbol.get(symbol, 0.0))
@@ -1154,7 +1199,7 @@ async def scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                             f"- symbol: {symbol}\n"
                             f"- spent: {spend:.2f} {quote_cur} (cap totale {quote_cap:.2f}, residuo pre-buy {remaining:.2f})\n"
                             f"- price: {res.fill_price if res.fill_price is not None else 'n/a'}\n"
-                            f"- motivo: mom_1h={fmt_pct(sig.mom_1h)}≥{fmt_pct(risk.mom_1h_threshold)} AND mom_15m={fmt_pct(sig.mom_15m)}≥{fmt_pct(risk.mom_15m_threshold)}; top mover 15m; max_positions={max_pos}\n"
+                            f"- motivo: mom_1h={fmt_pct(sig.mom_1h)}≥{fmt_pct(risk.mom_1h_threshold)} AND mom_15m={fmt_pct(sig.mom_15m)}≥{fmt_pct(risk.mom_15m_threshold)}; top mover 15m; max_positions={max_pos}; cap totale={quote_cap:.2f} {quote_cur}\n"
                             f"- order_id: {res.order_id}\n"
                         ),
                     )
@@ -1170,7 +1215,10 @@ async def scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     # Evaluate trailing stops / reversal alerts for OPEN positions
     positions = await asyncio.to_thread(store.list_positions)
     for p in positions:
-        last_price = await asyncio.to_thread(md.get_last_price, p.symbol)
+        # For Revolut-traded symbols (e.g. *-USDC), use Revolut X last price.
+        last_price = await asyncio.to_thread(rx.get_last_price, p.symbol)
+        if last_price is None:
+            last_price = await asyncio.to_thread(md.get_last_price, p.symbol)
         if last_price is None:
             continue
 

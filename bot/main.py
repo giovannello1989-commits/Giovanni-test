@@ -1064,6 +1064,13 @@ async def scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         if not is_within_operating_window(now, cfg.window_start, cfg.window_end):
             return
 
+    # Prevent overlapping scans (common when an API is slow and the interval is short).
+    scan_lock: asyncio.Lock = context.application.bot_data.setdefault("scan_lock", asyncio.Lock())
+    metrics: dict[str, Any] = context.application.bot_data.setdefault("metrics", {})
+    if scan_lock.locked():
+        metrics["last_scan_note"] = "scan skipped (previous scan still running)"
+        return
+
     risk = RISK_PROFILES.get(st["risk_mode"], RISK_PROFILES["aggressive"])
     entry_strategy = (st.get("entry_strategy") or "momentum").lower()
     breakout_pct = float(st.get("breakout_pct", 0.015))
@@ -1073,276 +1080,312 @@ async def scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
     live_exec: LiveRevolutXExecutor = context.application.bot_data["live_exec"]
     rx: RevolutXClient = context.application.bot_data["rx"]
 
-    metrics: dict[str, Any] = context.application.bot_data.setdefault("metrics", {})
-    metrics["last_scan_started"] = now.timestamp()
+    async with scan_lock:
+        scan_started_ts = now.timestamp()
+        metrics["last_scan_started"] = scan_started_ts
+        metrics["last_scan_note"] = "scan running"
 
-    # Load pairs from market data provider.
-    try:
-        pairs = await asyncio.to_thread(md.get_pairs)
-    except Exception as e:
-        metrics["scans_err"] = int(metrics.get("scans_err", 0)) + 1
-        metrics["last_error"] = f"get_pairs error: {repr(e)}"
-        metrics["last_scan_note"] = "get_pairs exception"
-        metrics["last_scan_completed"] = datetime.now(cfg.tz).timestamp()
-        return
+        try:
+            # Load pairs from market data provider.
+            try:
+                pairs = await asyncio.to_thread(md.get_pairs)
+            except Exception as e:
+                metrics["scans_err"] = int(metrics.get("scans_err", 0)) + 1
+                metrics["last_error"] = f"get_pairs error: {repr(e)}"
+                metrics["last_scan_note"] = "get_pairs exception"
+                metrics["last_scan_completed"] = datetime.now(cfg.tz).timestamp()
+                return
 
-    metrics["last_pairs_count"] = len(pairs) if pairs is not None else None
-    if not pairs:
-        metrics["scans_ok"] = int(metrics.get("scans_ok", 0)) + 1
-        metrics["last_scan_note"] = "get_pairs returned empty"
-        metrics["last_scan_completed"] = datetime.now(cfg.tz).timestamp()
-        return
-    pairs_limit = int(st.get("pairs_limit", cfg.pairs_limit))
-    pairs = pairs[:pairs_limit]
+            metrics["last_pairs_count"] = len(pairs) if pairs is not None else None
+            if not pairs:
+                metrics["scans_ok"] = int(metrics.get("scans_ok", 0)) + 1
+                metrics["last_scan_note"] = "get_pairs returned empty"
+                metrics["last_scan_completed"] = datetime.now(cfg.tz).timestamp()
+                return
+            pairs_limit = int(st.get("pairs_limit", cfg.pairs_limit))
+            pairs = pairs[:pairs_limit]
 
-    last_signal_by_symbol: dict[str, float] = context.application.bot_data.setdefault("last_signal_by_symbol", {})
-    last_mom15_sign: dict[str, int] = context.application.bot_data.setdefault("last_mom15_sign", {})
+            last_signal_by_symbol: dict[str, float] = context.application.bot_data.setdefault("last_signal_by_symbol", {})
+            last_mom15_sign: dict[str, int] = context.application.bot_data.setdefault("last_mom15_sign", {})
 
-    autotrade_on = int(st.get("autotrade_enabled", 0)) == 1
-    quote_cap = float(st.get("autotrade_max_quote", 100.0))
-    quote_cur = str(st.get("autotrade_quote_currency", "USDT")).upper()
-    max_pos = int(st.get("autotrade_max_positions", 3))
-    exec_mode = str(st.get("autotrade_mode", "paper")).lower()
-    executor = live_exec if exec_mode == "live" else paper_exec
-    candidates: list[tuple[str, Any]] = []
+            autotrade_on = int(st.get("autotrade_enabled", 0)) == 1
+            quote_cap = float(st.get("autotrade_max_quote", 100.0))
+            quote_cur = str(st.get("autotrade_quote_currency", "USDT")).upper()
+            max_pos = int(st.get("autotrade_max_positions", 3))
+            exec_mode = str(st.get("autotrade_mode", "paper")).lower()
+            executor = live_exec if exec_mode == "live" else paper_exec
+            candidates: list[tuple[str, Any]] = []
 
-    # Cache for "is this tradable on Revolut X?" checks
-    pair_cache: dict[str, Any] = context.application.bot_data.setdefault("revx_pair_cache", {})
-    cache_ttl_seconds = int(os.getenv("REVX_PAIR_CACHE_TTL_SECONDS", "21600"))  # 6h
+            # Cache for "is this tradable on Revolut X?" checks
+            pair_cache: dict[str, Any] = context.application.bot_data.setdefault("revx_pair_cache", {})
+            cache_ttl_seconds = int(os.getenv("REVX_PAIR_CACHE_TTL_SECONDS", "21600"))  # 6h
 
-    def _map_to_revx_symbol(market_symbol: str) -> str:
-        base = market_symbol.split("-")[0].upper()
-        return f"{base}-{quote_cur}"
+            def _map_to_revx_symbol(market_symbol: str) -> str:
+                base = market_symbol.split("-")[0].upper()
+                return f"{base}-{quote_cur}"
 
-    async def _revx_pair_exists(symbol: str) -> bool:
-        now_ts = now.timestamp()
-        cached = pair_cache.get(symbol)
-        if cached and isinstance(cached, dict):
-            if (now_ts - float(cached.get("ts", 0))) < cache_ttl_seconds:
-                return bool(cached.get("ok", False))
-        ok = await asyncio.to_thread(rx.pair_exists_via_trades_private, symbol)
-        pair_cache[symbol] = {"ok": ok, "ts": now_ts}
-        return ok
+            async def _revx_pair_exists(symbol: str) -> bool:
+                now_ts = now.timestamp()
+                cached = pair_cache.get(symbol)
+                if cached and isinstance(cached, dict):
+                    if (now_ts - float(cached.get("ts", 0))) < cache_ttl_seconds:
+                        return bool(cached.get("ok", False))
+                ok = await asyncio.to_thread(rx.pair_exists_via_trades_private, symbol)
+                pair_cache[symbol] = {"ok": ok, "ts": now_ts}
+                return ok
 
-    # Scan momentum for candidate BUY signals
-    try:
-        for symbol in pairs:
-            candles = await asyncio.to_thread(md.get_candles, symbol, "5m", 13)
-            mom = compute_momentum_from_5m_candles(symbol, candles)
-            if not mom:
-                continue
+            # Fetch candles concurrently (prevents "N*timeout" stalls when provider is slow).
+            scan_concurrency = int(os.getenv("SCAN_CONCURRENCY", "8"))
+            sem = asyncio.Semaphore(max(1, scan_concurrency))
 
-            entry: EntrySignal | None = None
-            if entry_strategy == "momentum":
-                if mom.mom_1h >= risk.mom_1h_threshold and mom.mom_15m >= risk.mom_15m_threshold:
-                    entry = EntrySignal(
-                        kind="momentum",
-                        symbol=symbol,
-                        last_price=mom.last_price,
-                        mom_1h=mom.mom_1h,
-                        mom_15m=mom.mom_15m,
-                        reason=f"mom_1h {fmt_pct(mom.mom_1h)}≥{fmt_pct(risk.mom_1h_threshold)} AND mom_15m {fmt_pct(mom.mom_15m)}≥{fmt_pct(risk.mom_15m_threshold)}",
-                    )
-            elif entry_strategy == "breakout":
-                entry = compute_breakout_signal(symbol, candles, breakout_pct)
-                # keep mom for ranking if available
-                if entry and mom:
-                    entry = EntrySignal(kind=entry.kind, symbol=entry.symbol, last_price=entry.last_price, reason=entry.reason, mom_1h=mom.mom_1h, mom_15m=mom.mom_15m)
-            elif entry_strategy == "dip":
-                entry = compute_dip_signal(symbol, candles, dip_pct)
-                if entry and mom:
-                    entry = EntrySignal(kind=entry.kind, symbol=entry.symbol, last_price=entry.last_price, reason=entry.reason, mom_1h=mom.mom_1h, mom_15m=mom.mom_15m)
+            async def _fetch(symbol: str) -> tuple[str, Any | None, list[dict[str, Any]]]:
+                async with sem:
+                    candles = await asyncio.to_thread(md.get_candles, symbol, "5m", 13)
+                mom = compute_momentum_from_5m_candles(symbol, candles)
+                return symbol, mom, candles
 
-            if entry:
-                # Collect candidates for auto-buy (we'll take top N)
-                revx_symbol = _map_to_revx_symbol(symbol)
-                if await _revx_pair_exists(revx_symbol):
-                    # send signal only if tradable on Revolut X
-                    now_ts = now.timestamp()
-                    last_ts = float(last_signal_by_symbol.get(revx_symbol, 0.0))
-                    if now_ts - last_ts >= cfg.signal_cooldown_seconds:
-                        last_signal_by_symbol[revx_symbol] = now_ts
-                        owner = await _get_owner_chat_id(context)
-                        if owner is not None:
-                            parts = [
-                                "*CANDIDATE BUY (tradable on Revolut X)*",
-                                f"- market symbol: `{symbol}` (source: {context.application.bot_data.get('md_provider','market')})",
-                                f"- revolut symbol: `{revx_symbol}`",
-                                f"- market price: `{entry.last_price:.8g}`",
-                                f"- strategy: `{entry.kind}`",
-                            ]
-                            if entry.mom_1h is not None:
-                                parts.append(f"- momentum 1h: `{fmt_pct(entry.mom_1h)}`")
-                            if entry.mom_15m is not None:
-                                parts.append(f"- momentum 15m: `{fmt_pct(entry.mom_15m)}`")
-                            parts.append(f"- cap totale: `{quote_cap:.2f} {quote_cur}`")
-                            parts.append("")
-                            parts.append(f"_Motivo: {entry.reason}_")
+            fetch_results = await asyncio.gather(*(_fetch(s) for s in pairs), return_exceptions=True)
+
+            # Scan momentum for candidate BUY signals
+            try:
+                for r in fetch_results:
+                    if isinstance(r, Exception):
+                        continue
+                    symbol, mom, candles = r
+                    if not mom:
+                        continue
+
+                    entry: EntrySignal | None = None
+                    if entry_strategy == "momentum":
+                        if mom.mom_1h >= risk.mom_1h_threshold and mom.mom_15m >= risk.mom_15m_threshold:
+                            entry = EntrySignal(
+                                kind="momentum",
+                                symbol=symbol,
+                                last_price=mom.last_price,
+                                mom_1h=mom.mom_1h,
+                                mom_15m=mom.mom_15m,
+                                reason=f"mom_1h {fmt_pct(mom.mom_1h)}≥{fmt_pct(risk.mom_1h_threshold)} AND mom_15m {fmt_pct(mom.mom_15m)}≥{fmt_pct(risk.mom_15m_threshold)}",
+                            )
+                    elif entry_strategy == "breakout":
+                        entry = compute_breakout_signal(symbol, candles, breakout_pct)
+                        # keep mom for ranking if available
+                        if entry:
+                            entry = EntrySignal(
+                                kind=entry.kind,
+                                symbol=entry.symbol,
+                                last_price=entry.last_price,
+                                reason=entry.reason,
+                                mom_1h=mom.mom_1h,
+                                mom_15m=mom.mom_15m,
+                            )
+                    elif entry_strategy == "dip":
+                        entry = compute_dip_signal(symbol, candles, dip_pct)
+                        if entry:
+                            entry = EntrySignal(
+                                kind=entry.kind,
+                                symbol=entry.symbol,
+                                last_price=entry.last_price,
+                                reason=entry.reason,
+                                mom_1h=mom.mom_1h,
+                                mom_15m=mom.mom_15m,
+                            )
+
+                    if entry:
+                        # Collect candidates for auto-buy (we'll take top N)
+                        revx_symbol = _map_to_revx_symbol(symbol)
+                        if await _revx_pair_exists(revx_symbol):
+                            # send signal only if tradable on Revolut X
+                            now_ts = now.timestamp()
+                            last_ts = float(last_signal_by_symbol.get(revx_symbol, 0.0))
+                            if now_ts - last_ts >= cfg.signal_cooldown_seconds:
+                                last_signal_by_symbol[revx_symbol] = now_ts
+                                owner = await _get_owner_chat_id(context)
+                                if owner is not None:
+                                    parts = [
+                                        "*CANDIDATE BUY (tradable on Revolut X)*",
+                                        f"- market symbol: `{symbol}` (source: {context.application.bot_data.get('md_provider','market')})",
+                                        f"- revolut symbol: `{revx_symbol}`",
+                                        f"- market price: `{entry.last_price:.8g}`",
+                                        f"- strategy: `{entry.kind}`",
+                                    ]
+                                    if entry.mom_1h is not None:
+                                        parts.append(f"- momentum 1h: `{fmt_pct(entry.mom_1h)}`")
+                                    if entry.mom_15m is not None:
+                                        parts.append(f"- momentum 15m: `{fmt_pct(entry.mom_15m)}`")
+                                    parts.append(f"- cap totale: `{quote_cap:.2f} {quote_cur}`")
+                                    parts.append("")
+                                    parts.append(f"_Motivo: {entry.reason}_")
+                                    await context.application.bot.send_message(
+                                        chat_id=owner,
+                                        text="\n".join(parts),
+                                        parse_mode=ParseMode.MARKDOWN,
+                                    )
+                                    metrics["signals_sent"] = int(metrics.get("signals_sent", 0)) + 1
+                                    metrics["last_signal_ts"] = now_ts
+
+                            if autotrade_on:
+                                candidates.append((revx_symbol, entry))
+
+                    # Track sign of mom_15m (for reversal alerts on open positions)
+                    mom_sign = 1 if mom.mom_15m > 0 else (-1 if mom.mom_15m < 0 else 0)
+                    last_mom15_sign[symbol] = mom_sign
+                    # Also store with the Revolut-mapped symbol key for consistency with positions.
+                    last_mom15_sign[_map_to_revx_symbol(symbol)] = mom_sign
+            except Exception as e:
+                metrics["scans_err"] = int(metrics.get("scans_err", 0)) + 1
+                metrics["last_error"] = f"scan loop error: {repr(e)}"
+                metrics["last_scan_note"] = "scan loop exception"
+                metrics["last_scan_completed"] = datetime.now(cfg.tz).timestamp()
+                return
+
+            # AUTO BUY: open up to max_pos positions, total exposure <= quote_cap.
+            if autotrade_on and candidates:
+                # Highest 15m momentum first
+                # Prefer momentum ranking if available, otherwise keep stable order.
+                def _rank(item):
+                    ent = item[1]
+                    return float(ent.mom_15m) if getattr(ent, "mom_15m", None) is not None else 0.0
+
+                candidates.sort(key=_rank, reverse=True)
+                owner = await _get_owner_chat_id(context)
+                if owner is not None:
+                    for symbol, entry in candidates:
+                        open_notional = await asyncio.to_thread(total_open_notional, store, quote_cur)
+                        remaining = max(0.0, quote_cap - float(open_notional))
+                        decision = decide_autobuy(
+                            store=store,
+                            symbol=symbol,
+                            quote_cap_total=quote_cap,
+                            quote_currency=quote_cur,
+                            min_trade_quote=10.0,
+                            max_positions=max_pos,
+                        )
+                        if decision.action != "BUY" or not decision.quote_amount:
+                            continue
+                        spend = min(float(decision.quote_amount), remaining)
+                        if spend < 10.0:
+                            continue
+                        res = await asyncio.to_thread(executor.buy_quote, symbol, spend)
+                        if res.ok:
+                            metrics["last_trade_action"] = f"BUY {symbol} {spend:.2f} {quote_cur} ({exec_mode})"
+                            metrics["last_trade_ts"] = now.timestamp()
                             await context.application.bot.send_message(
                                 chat_id=owner,
-                                text="\n".join(parts),
-                                parse_mode=ParseMode.MARKDOWN,
+                                text=(
+                                    "AUTO BUY\n"
+                                    f"- symbol: {symbol}\n"
+                                    f"- spent: {spend:.2f} {quote_cur} (cap totale {quote_cap:.2f}, residuo pre-buy {remaining:.2f})\n"
+                                    f"- price: {res.fill_price if res.fill_price is not None else 'n/a'}\n"
+                                    f"- strategy: {entry.kind}\n"
+                                    f"- motivo: {entry.reason}\n"
+                                    f"- max_positions: {max_pos} cap totale={quote_cap:.2f} {quote_cur}\n"
+                                    f"- order_id: {res.order_id}\n"
+                                ),
                             )
-                            metrics["signals_sent"] = int(metrics.get("signals_sent", 0)) + 1
-                            metrics["last_signal_ts"] = now_ts
+                        else:
+                            metrics["last_trade_action"] = f"BUY FAILED {symbol} ({exec_mode})"
+                            metrics["last_trade_ts"] = now.timestamp()
+                            await context.application.bot.send_message(chat_id=owner, text=f"AUTO BUY FAILED\n- symbol: {symbol}\n- error: {res.error}")
+                        # Stop if we've filled the cap or reached max positions
+                        open_notional2 = await asyncio.to_thread(total_open_notional, store, quote_cur)
+                        if open_notional2 >= quote_cap - 1e-6:
+                            break
 
-                    if autotrade_on:
-                        candidates.append((revx_symbol, entry))
-
-            # Track sign of mom_15m (for reversal alerts on open positions)
-            mom_sign = 1 if mom.mom_15m > 0 else (-1 if mom.mom_15m < 0 else 0)
-            last_mom15_sign[symbol] = mom_sign
-            # Also store with the Revolut-mapped symbol key for consistency with positions.
-            last_mom15_sign[_map_to_revx_symbol(symbol)] = mom_sign
-    except Exception as e:
-        metrics["scans_err"] = int(metrics.get("scans_err", 0)) + 1
-        metrics["last_error"] = f"scan loop error: {repr(e)}"
-        metrics["last_scan_note"] = "scan loop exception"
-        metrics["last_scan_completed"] = datetime.now(cfg.tz).timestamp()
-        return
-
-    # AUTO BUY: open up to max_pos positions, total exposure <= quote_cap.
-    if autotrade_on and candidates:
-        # Highest 15m momentum first
-        # Prefer momentum ranking if available, otherwise keep stable order.
-        def _rank(item):
-            ent = item[1]
-            return float(ent.mom_15m) if getattr(ent, "mom_15m", None) is not None else 0.0
-        candidates.sort(key=_rank, reverse=True)
-        owner = await _get_owner_chat_id(context)
-        if owner is not None:
-            for symbol, entry in candidates:
-                open_notional = await asyncio.to_thread(total_open_notional, store, quote_cur)
-                remaining = max(0.0, quote_cap - float(open_notional))
-                decision = decide_autobuy(
-                    store=store,
-                    symbol=symbol,
-                    quote_cap_total=quote_cap,
-                    quote_currency=quote_cur,
-                    min_trade_quote=10.0,
-                    max_positions=max_pos,
-                )
-                if decision.action != "BUY" or not decision.quote_amount:
+            # Evaluate trailing stops / reversal alerts for OPEN positions
+            positions = await asyncio.to_thread(store.list_positions)
+            for p in positions:
+                # For Revolut-traded symbols (e.g. *-USDC), use Revolut X last price.
+                last_price = await asyncio.to_thread(rx.get_last_price, p.symbol)
+                if last_price is None:
+                    last_price = await asyncio.to_thread(md.get_last_price, p.symbol)
+                if last_price is None:
                     continue
-                spend = min(float(decision.quote_amount), remaining)
-                if spend < 10.0:
-                    continue
-                res = await asyncio.to_thread(executor.buy_quote, symbol, spend)
-                if res.ok:
-                    metrics["last_trade_action"] = f"BUY {symbol} {spend:.2f} {quote_cur} ({exec_mode})"
-                    metrics["last_trade_ts"] = now.timestamp()
+
+                # Update peak
+                if last_price > p.peak_price:
+                    await asyncio.to_thread(store.update_peak, p.symbol, last_price)
+                    peak = last_price
+                else:
+                    peak = p.peak_price
+
+                # Trailing stop alert
+                if last_price <= peak * (1.0 - risk.trailing_stop_pct):
+                    owner = await _get_owner_chat_id(context)
+                    if owner is None:
+                        continue
+                    # If autotrade enabled: auto-sell
+                    if int(st.get("autotrade_enabled", 0)) == 1:
+                        exec_mode = str(st.get("autotrade_mode", "paper")).lower()
+                        ex = live_exec if exec_mode == "live" else paper_exec
+                        res = await asyncio.to_thread(ex.sell_all, p.symbol)
+                        if res.ok:
+                            # realized PnL is stored by storage.add_sell; compute quick % vs entry
+                            pnl_quote = (last_price - p.avg_entry) * p.qty
+                            pct = ((last_price - p.avg_entry) / p.avg_entry) if p.avg_entry else 0.0
+                            metrics["last_trade_action"] = f"SELL {p.symbol} ({exec_mode}) pnl≈{pnl_quote:+.2f}"
+                            metrics["last_trade_ts"] = now.timestamp()
+                            await context.application.bot.send_message(
+                                chat_id=owner,
+                                text=(
+                                    "AUTO SELL (trailing stop)\n"
+                                    f"- symbol: {p.symbol}\n"
+                                    f"- last: {last_price:.8g}\n"
+                                    f"- entry: {p.avg_entry:.8g}\n"
+                                    f"- peak: {peak:.8g}\n"
+                                    f"- pnl≈ {pnl_quote:+.2f} ({pct*100:+.2f}%)\n"
+                                    f"- reason: last <= peak*(1-{risk.trailing_stop_pct*100:.2f}%)\n"
+                                    f"- order_id: {res.order_id}\n"
+                                ),
+                            )
+                            continue
+                        else:
+                            await context.application.bot.send_message(
+                                chat_id=owner,
+                                text=f"AUTO SELL FAILED\n- symbol: {p.symbol}\n- error: {res.error}",
+                            )
                     await context.application.bot.send_message(
                         chat_id=owner,
                         text=(
-                            "AUTO BUY\n"
-                            f"- symbol: {symbol}\n"
-                            f"- spent: {spend:.2f} {quote_cur} (cap totale {quote_cap:.2f}, residuo pre-buy {remaining:.2f})\n"
-                            f"- price: {res.fill_price if res.fill_price is not None else 'n/a'}\n"
-                            f"- strategy: {entry.kind}\n"
-                            f"- motivo: {entry.reason}\n"
-                            f"- max_positions: {max_pos} cap totale={quote_cap:.2f} {quote_cur}\n"
-                            f"- order_id: {res.order_id}\n"
+                            "*EXIT ALERT (trailing stop)*\n"
+                            f"- symbol: `{p.symbol}`\n"
+                            f"- last: `{last_price:.8g}`\n"
+                            f"- peak: `{peak:.8g}`\n"
+                            f"- trailing: `{fmt_pct(risk.trailing_stop_pct)}`\n\n"
+                            "_Il bot non può chiudere posizioni: chiudi manualmente se necessario._"
                         ),
+                        parse_mode=ParseMode.MARKDOWN,
                     )
-                else:
-                    metrics["last_trade_action"] = f"BUY FAILED {symbol} ({exec_mode})"
-                    metrics["last_trade_ts"] = now.timestamp()
-                    await context.application.bot.send_message(chat_id=owner, text=f"AUTO BUY FAILED\n- symbol: {symbol}\n- error: {res.error}")
-                # Stop if we've filled the cap or reached max positions
-                open_notional2 = await asyncio.to_thread(total_open_notional, store, quote_cur)
-                if open_notional2 >= quote_cap - 1e-6:
-                    break
 
-    # Evaluate trailing stops / reversal alerts for OPEN positions
-    positions = await asyncio.to_thread(store.list_positions)
-    for p in positions:
-        # For Revolut-traded symbols (e.g. *-USDC), use Revolut X last price.
-        last_price = await asyncio.to_thread(rx.get_last_price, p.symbol)
-        if last_price is None:
-            last_price = await asyncio.to_thread(md.get_last_price, p.symbol)
-        if last_price is None:
-            continue
+                # Reversal: mom_15m negative after being positive (best-effort)
+                candles = await asyncio.to_thread(md.get_candles, p.symbol, "5m", 13)
+                sig = compute_momentum_from_5m_candles(p.symbol, candles)
+                if sig:
+                    prev = last_mom15_sign.get(p.symbol, 0)
+                    cur = 1 if sig.mom_15m > 0 else (-1 if sig.mom_15m < 0 else 0)
+                    last_mom15_sign[p.symbol] = cur
+                    if prev > 0 and cur < 0:
+                        owner = await _get_owner_chat_id(context)
+                        if owner is None:
+                            continue
+                        await context.application.bot.send_message(
+                            chat_id=owner,
+                            text=(
+                                "*EXIT ALERT (reversal 15m)*\n"
+                                f"- symbol: `{p.symbol}`\n"
+                                f"- momentum 15m: `{fmt_pct(sig.mom_15m)}`\n\n"
+                                "_Il bot non può chiudere posizioni: chiudi manualmente se necessario._"
+                            ),
+                            parse_mode=ParseMode.MARKDOWN,
+                        )
 
-        # Update peak
-        if last_price > p.peak_price:
-            await asyncio.to_thread(store.update_peak, p.symbol, last_price)
-            peak = last_price
-        else:
-            peak = p.peak_price
-
-        # Trailing stop alert
-        if last_price <= peak * (1.0 - risk.trailing_stop_pct):
-            owner = await _get_owner_chat_id(context)
-            if owner is None:
-                continue
-            # If autotrade enabled: auto-sell
-            if int(st.get("autotrade_enabled", 0)) == 1:
-                exec_mode = str(st.get("autotrade_mode", "paper")).lower()
-                ex = live_exec if exec_mode == "live" else paper_exec
-                res = await asyncio.to_thread(ex.sell_all, p.symbol)
-                if res.ok:
-                    # realized PnL is stored by storage.add_sell; compute quick % vs entry
-                    pnl_quote = (last_price - p.avg_entry) * p.qty
-                    pct = ((last_price - p.avg_entry) / p.avg_entry) if p.avg_entry else 0.0
-                    metrics["last_trade_action"] = f"SELL {p.symbol} ({exec_mode}) pnl≈{pnl_quote:+.2f}"
-                    metrics["last_trade_ts"] = now.timestamp()
-                    await context.application.bot.send_message(
-                        chat_id=owner,
-                        text=(
-                            "AUTO SELL (trailing stop)\n"
-                            f"- symbol: {p.symbol}\n"
-                            f"- last: {last_price:.8g}\n"
-                            f"- entry: {p.avg_entry:.8g}\n"
-                            f"- peak: {peak:.8g}\n"
-                            f"- pnl≈ {pnl_quote:+.2f} ({pct*100:+.2f}%)\n"
-                            f"- reason: last <= peak*(1-{risk.trailing_stop_pct*100:.2f}%)\n"
-                            f"- order_id: {res.order_id}\n"
-                        ),
-                    )
-                    continue
-                else:
-                    await context.application.bot.send_message(
-                        chat_id=owner,
-                        text=f"AUTO SELL FAILED\n- symbol: {p.symbol}\n- error: {res.error}",
-                    )
-            await context.application.bot.send_message(
-                chat_id=owner,
-                text=(
-                    "*EXIT ALERT (trailing stop)*\n"
-                    f"- symbol: `{p.symbol}`\n"
-                    f"- last: `{last_price:.8g}`\n"
-                    f"- peak: `{peak:.8g}`\n"
-                    f"- trailing: `{fmt_pct(risk.trailing_stop_pct)}`\n\n"
-                    "_Il bot non può chiudere posizioni: chiudi manualmente se necessario._"
-                ),
-                parse_mode=ParseMode.MARKDOWN,
-            )
-
-        # Reversal: mom_15m negative after being positive (best-effort)
-        candles = await asyncio.to_thread(md.get_candles, p.symbol, "5m", 13)
-        sig = compute_momentum_from_5m_candles(p.symbol, candles)
-        if sig:
-            prev = last_mom15_sign.get(p.symbol, 0)
-            cur = 1 if sig.mom_15m > 0 else (-1 if sig.mom_15m < 0 else 0)
-            last_mom15_sign[p.symbol] = cur
-            if prev > 0 and cur < 0:
-                owner = await _get_owner_chat_id(context)
-                if owner is None:
-                    continue
-                await context.application.bot.send_message(
-                    chat_id=owner,
-                    text=(
-                        "*EXIT ALERT (reversal 15m)*\n"
-                        f"- symbol: `{p.symbol}`\n"
-                        f"- momentum 15m: `{fmt_pct(sig.mom_15m)}`\n\n"
-                        "_Il bot non può chiudere posizioni: chiudi manualmente se necessario._"
-                    ),
-                    parse_mode=ParseMode.MARKDOWN,
-                )
-
-    metrics["scans_ok"] = int(metrics.get("scans_ok", 0)) + 1
-    metrics["last_scan_note"] = "scan completed"
-    metrics["last_scan_completed"] = datetime.now(cfg.tz).timestamp()
+            metrics["scans_ok"] = int(metrics.get("scans_ok", 0)) + 1
+            metrics["last_scan_note"] = "scan completed"
+            metrics["last_scan_completed"] = datetime.now(cfg.tz).timestamp()
+        finally:
+            # If something unexpected happened and we returned without setting completion,
+            # mark completion to avoid "started but never completed" statuses forever.
+            if metrics.get("last_scan_started") == scan_started_ts and metrics.get("last_scan_completed") is None:
+                metrics["last_scan_completed"] = datetime.now(cfg.tz).timestamp()
 
 
 async def status_ping_job(context: ContextTypes.DEFAULT_TYPE) -> None:

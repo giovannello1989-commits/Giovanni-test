@@ -29,6 +29,11 @@ DEFAULT_SETTINGS = {
     "autotrade_max_quote": 100.0,
     "autotrade_quote_currency": "USDT",
     "autotrade_max_positions": 3,
+    # Multi-quote caps (optional):
+    # - autotrade_quote_currencies: comma-separated list, e.g. "USDC,USDT"
+    # - autotrade_caps_json: JSON object mapping quote->cap, e.g. {"USDC":100,"USDT":100}
+    "autotrade_quote_currencies": "",
+    "autotrade_caps_json": "",
     # How to interpret autotrade_max_quote:
     # - fixed: hard cap (default)
     # - balance: min(cap, available balance)
@@ -170,6 +175,8 @@ class Storage:
             _ensure_col("autotrade_max_quote", "autotrade_max_quote REAL NOT NULL DEFAULT 100.0", DEFAULT_SETTINGS["autotrade_max_quote"])
             _ensure_col("autotrade_quote_currency", "autotrade_quote_currency TEXT NOT NULL DEFAULT 'USDT'", DEFAULT_SETTINGS["autotrade_quote_currency"])
             _ensure_col("autotrade_max_positions", "autotrade_max_positions INTEGER NOT NULL DEFAULT 3", DEFAULT_SETTINGS["autotrade_max_positions"])
+            _ensure_col("autotrade_quote_currencies", "autotrade_quote_currencies TEXT NOT NULL DEFAULT ''", DEFAULT_SETTINGS["autotrade_quote_currencies"])
+            _ensure_col("autotrade_caps_json", "autotrade_caps_json TEXT NOT NULL DEFAULT ''", DEFAULT_SETTINGS["autotrade_caps_json"])
             _ensure_col("autotrade_cap_mode", "autotrade_cap_mode TEXT NOT NULL DEFAULT 'fixed'", DEFAULT_SETTINGS["autotrade_cap_mode"])
             _ensure_col("market_data_provider", "market_data_provider TEXT NOT NULL DEFAULT 'binance'", DEFAULT_SETTINGS["market_data_provider"])
             _ensure_col("market_data_quote", "market_data_quote TEXT NOT NULL DEFAULT 'USDT'", DEFAULT_SETTINGS["market_data_quote"])
@@ -215,6 +222,8 @@ class Storage:
             "autotrade_max_quote",
             "autotrade_quote_currency",
             "autotrade_max_positions",
+            "autotrade_quote_currencies",
+            "autotrade_caps_json",
             "autotrade_cap_mode",
             "market_data_provider",
             "market_data_quote",
@@ -249,6 +258,8 @@ class Storage:
                     autotrade_max_quote=?,
                     autotrade_quote_currency=?,
                     autotrade_max_positions=?,
+                    autotrade_quote_currencies=?,
+                    autotrade_caps_json=?,
                     autotrade_cap_mode=?,
                     market_data_provider=?,
                     market_data_quote=?,
@@ -274,6 +285,8 @@ class Storage:
                     DEFAULT_SETTINGS["autotrade_max_quote"],
                     DEFAULT_SETTINGS["autotrade_quote_currency"],
                     DEFAULT_SETTINGS["autotrade_max_positions"],
+                    DEFAULT_SETTINGS["autotrade_quote_currencies"],
+                    DEFAULT_SETTINGS["autotrade_caps_json"],
                     DEFAULT_SETTINGS["autotrade_cap_mode"],
                     DEFAULT_SETTINGS["market_data_provider"],
                     DEFAULT_SETTINGS["market_data_quote"],

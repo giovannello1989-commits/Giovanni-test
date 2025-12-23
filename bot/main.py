@@ -164,6 +164,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     autotrade_mode = st.get("autotrade_mode", "paper")
     cap_amt = st.get("autotrade_max_quote", 100.0)
     cap_cur = st.get("autotrade_quote_currency", "USDT")
+    multi_quotes = st.get("autotrade_quote_currencies") or ""
+    multicaps = st.get("autotrade_caps_json") or ""
+    cap_effective_by_quote = (context.application.bot_data.get("metrics", {}) or {}).get("cap_effective_by_quote")
 
     msg = (
         "*Revolut X AutoTrade Bot*\n\n"
@@ -172,7 +175,10 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"- run mode: `{run_mode}` (always=24/7)\n"
         f"- scanner paused: `{bool(st['paused'])}`\n"
         f"- risk: `{risk.name}` (mom_1h≥{fmt_pct(risk.mom_1h_threshold)}, mom_15m≥{fmt_pct(risk.mom_15m_threshold)}, trailing={fmt_pct(risk.trailing_stop_pct)})\n"
-        f"- autotrade: `{autotrade_enabled}` mode=`{autotrade_mode}` cap=`{cap_amt} {cap_cur}`\n\n"
+        f"- autotrade: `{autotrade_enabled}` mode=`{autotrade_mode}` cap=`{cap_amt} {cap_cur}`\n"
+        f"- multi_quotes: `{multi_quotes or 'n/a'}`\n"
+        f"- multicaps: `{multicaps or 'n/a'}`\n"
+        f"- cap_effective_by_quote (last scan): `{cap_effective_by_quote or 'n/a'}`\n\n"
         "Comandi principali:\n"
         "- /status\n"
         "- /wallet\n"

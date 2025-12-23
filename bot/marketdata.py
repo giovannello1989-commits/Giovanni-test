@@ -162,6 +162,34 @@ class BinancePublicClient(MarketDataClient):
         out = [self._to_dash_symbol(base, quote) for _, base, quote in rows[: max(1, int(limit))]]
         return out
 
+    def get_top_volume(self, limit: int = 50) -> list[str]:
+        """
+        Returns the top pairs by 24h quote volume for this quote currency.
+        This tends to include majors (BTC, ETH, SOL, etc.) and is more likely
+        to overlap with Revolut X listings than "top movers".
+        """
+        data = self._request_json("/api/v3/ticker/24hr")
+        if not isinstance(data, list):
+            return []
+        rows: list[tuple[float, str, str]] = []
+        for r in data:
+            if not isinstance(r, dict):
+                continue
+            sym = str(r.get("symbol", "")).upper()
+            if not sym.endswith(self.quote):
+                continue
+            try:
+                qv = float(r.get("quoteVolume"))
+            except Exception:
+                continue
+            base = sym[: -len(self.quote)]
+            if not base:
+                continue
+            rows.append((qv, base, self.quote))
+        rows.sort(key=lambda x: x[0], reverse=True)
+        out = [self._to_dash_symbol(base, quote) for _, base, quote in rows[: max(1, int(limit))]]
+        return out
+
 
 class RevolutXMarketDataClient(MarketDataClient):
     """

@@ -1200,8 +1200,8 @@ async def scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         try:
             # Load pairs from market data provider.
             # If provider is Binance, we can optionally scan only "top movers" to find more opportunities.
-            # Default to Revolut-X-only universe so we don't chase Binance-only coins.
-            scan_universe = (os.getenv("SCAN_UNIVERSE", "revx") or "revx").lower().strip()
+            # Default to high-liquidity universe (more overlap with Revolut X).
+            scan_universe = (os.getenv("SCAN_UNIVERSE", "topvolume") or "topvolume").lower().strip()
             pairs: list[str] = []
             try:
                 # Cache Revolut public symbols (used both for revx universe and for tradable checks).
@@ -1236,9 +1236,18 @@ async def scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                     pairs = sorted([s for s in revx_symbols if s.split("-")[-1].upper() in qs])
                     metrics["scan_universe"] = "revx"
                     metrics["revx_public_symbols_count"] = len(revx_symbols)
+                    if not pairs:
+                        # If we couldn't fetch symbols, don't get stuck scanning alphabetic Binance list.
+                        # Fall back to top-volume majors (still filtered later by Revolut tradability).
+                        if hasattr(md, "get_top_volume"):
+                            pairs = await asyncio.to_thread(getattr(md, "get_top_volume"), int(st.get("pairs_limit", cfg.pairs_limit)))
+                            metrics["scan_universe"] = "topvolume(fallback)"
                 if scan_universe == "topmovers" and hasattr(md, "get_top_movers"):
                     pairs = await asyncio.to_thread(getattr(md, "get_top_movers"), int(st.get("pairs_limit", cfg.pairs_limit)))
                     metrics["scan_universe"] = "topmovers"
+                if scan_universe == "topvolume" and hasattr(md, "get_top_volume"):
+                    pairs = await asyncio.to_thread(getattr(md, "get_top_volume"), int(st.get("pairs_limit", cfg.pairs_limit)))
+                    metrics["scan_universe"] = "topvolume"
                 if not pairs:
                     pairs = await asyncio.to_thread(md.get_pairs)
                     metrics["scan_universe"] = "all"

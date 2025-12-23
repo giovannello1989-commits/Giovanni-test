@@ -1244,10 +1244,21 @@ async def scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                     metrics["revx_public_symbols_count"] = len(revx_symbols)
                     if not pairs:
                         # If we couldn't fetch symbols, don't get stuck scanning alphabetic Binance list.
-                        # Fall back to top-volume majors (still filtered later by Revolut tradability).
-                        if hasattr(md, "get_top_volume"):
-                            pairs = await asyncio.to_thread(getattr(md, "get_top_volume"), pairs_limit_cfg)
-                            metrics["scan_universe"] = "topvolume(fallback)"
+                        # Fall back to a curated "majors" list that is very likely tradable on Revolut.
+                        scan_universe = "revxmajors(fallback)"
+
+                if scan_universe in ("revxmajors", "majors", "revxmajors(fallback)"):
+                    # Scan a curated list of major bases, using market data quote (usually USDT) for momentum,
+                    # then map to Revolut quotes (USDC/USDT) at execution time.
+                    raw = os.getenv(
+                        "REVX_BASE_CANDIDATES",
+                        "BTC,ETH,SOL,XRP,ADA,DOGE,AVAX,DOT,LINK,MATIC,UNI,LTC,BCH,TRX,APT,ARB,OP,ATOM,NEAR,TON,PEPE,SHIB",
+                    )
+                    bases = [b.strip().upper() for b in raw.split(",") if b.strip()]
+                    md_quote = str(context.application.bot_data.get("md_quote", "USDT")).upper()
+                    pairs = [f"{b}-{md_quote}" for b in bases]
+                    metrics["scan_universe"] = "revxmajors"
+
                 if scan_universe == "topmovers" and hasattr(md, "get_top_movers"):
                     pairs = await asyncio.to_thread(getattr(md, "get_top_movers"), pairs_limit_cfg)
                     metrics["scan_universe"] = "topmovers"

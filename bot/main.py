@@ -1202,12 +1202,31 @@ async def scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             scan_universe = (os.getenv("SCAN_UNIVERSE", "revx") or "revx").lower().strip()
             pairs: list[str] = []
             try:
+                # Cache Revolut public symbols (used both for revx universe and for tradable checks).
+                revx_cache: dict[str, Any] = context.application.bot_data.setdefault("revx_public_symbols_cache", {})
+                revx_ttl = int(os.getenv("REVX_PUBLIC_SYMBOLS_TTL_SECONDS", "60") or "60")
+                now_ts = now.timestamp()
+                revx_symbols: set[str] = set()
+                try:
+                    cached = revx_cache.get("data")
+                    cached_ts = float(revx_cache.get("ts", 0) or 0)
+                    if isinstance(cached, list) and (now_ts - cached_ts) < revx_ttl:
+                        revx_symbols = {str(s).upper() for s in cached}
+                    else:
+                        revx_symbols = await asyncio.to_thread(rx.get_public_symbols)
+                        revx_cache["data"] = sorted(revx_symbols)
+                        revx_cache["ts"] = now_ts
+                except Exception:
+                    revx_symbols = set()
+
                 if scan_universe in ("revx", "revolutx"):
-                    # Scan only symbols that actually exist on Revolut X (fastest way to get tradable hits).
-                    # We infer tradable symbols from public last-trades.
-                    symbols = await asyncio.to_thread(rx.get_public_symbols)
-                    pairs = sorted(symbols)
+                    # Scan only symbols that actually exist on Revolut X and match our quote wallets.
+                    if "quotes" in locals() and isinstance(quotes, list) and quotes:
+                        pairs = sorted([s for s in revx_symbols if s.split("-")[-1].upper() in set(quotes)])
+                    else:
+                        pairs = sorted(list(revx_symbols))
                     metrics["scan_universe"] = "revx"
+                    metrics["revx_public_symbols_count"] = len(revx_symbols)
                 if scan_universe == "topmovers" and hasattr(md, "get_top_movers"):
                     pairs = await asyncio.to_thread(getattr(md, "get_top_movers"), int(st.get("pairs_limit", cfg.pairs_limit)))
                     metrics["scan_universe"] = "topmovers"
@@ -1334,7 +1353,17 @@ async def scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                 if cached and isinstance(cached, dict):
                     if (now_ts - float(cached.get("ts", 0))) < cache_ttl_seconds:
                         return bool(cached.get("ok", False))
-                ok = await asyncio.to_thread(rx.pair_exists_via_trades_private, symbol)
+                # Prefer public symbol list membership (more reliable than trades/private existence).
+                ok = False
+                try:
+                    revx_cache = context.application.bot_data.get("revx_public_symbols_cache", {})
+                    data = revx_cache.get("data")
+                    if isinstance(data, list) and data:
+                        ok = symbol.upper() in {str(s).upper() for s in data}
+                except Exception:
+                    ok = False
+                if not ok:
+                    ok = await asyncio.to_thread(rx.pair_exists_via_trades_private, symbol)
                 pair_cache[symbol] = {"ok": ok, "ts": now_ts}
                 return ok
 

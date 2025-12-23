@@ -565,6 +565,78 @@ async def cmd_autotrade(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     await update.message.reply_text("Comando non riconosciuto. Usa: on|off|mode|cap|capmode|quotes|multicaps")
 
+
+async def cmd_testbuy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /testbuy
+      -> tries a tiny market BUY on BTC-USDC (1 USDC) and BTC-USDT (1 USDT)
+
+    /testbuy SYMBOL AMOUNT
+      -> e.g. /testbuy BTC-USDC 1
+
+    /testbuy BASE AMOUNT QUOTE
+      -> e.g. /testbuy BTC 1 USDC
+    """
+    cfg: AppConfig = context.application.bot_data["cfg"]
+    if not _authorized(cfg, update):
+        return
+    owner = await _get_owner_chat_id(context)
+    chat = update.effective_chat
+    if owner is not None and chat and chat.id != owner:
+        return
+
+    # Safety: require explicit env confirmation for any live order.
+    if os.getenv("ALLOW_LIVE_TRADING", "0") != "1":
+        await update.message.reply_text(
+            "Test buy bloccato.\n"
+            "Per abilitare ordini reali imposta su Railway: `ALLOW_LIVE_TRADING=1` e riavvia."
+        )
+        return
+
+    store: Storage = context.application.bot_data["store"]
+    st = await asyncio.to_thread(store.get_settings)
+    if str(st.get("autotrade_mode", "paper")).lower() != "live":
+        await update.message.reply_text("Imposta prima: `/autotrade mode live`")
+        return
+
+    live_exec: LiveRevolutXExecutor = context.application.bot_data["live_exec"]
+
+    def _mk_symbol(base: str, quote: str) -> str:
+        return f"{base.upper()}-{quote.upper()}"
+
+    # Parse args
+    symbols_to_try: list[tuple[str, float, str]] = []
+    if not context.args:
+        base = os.getenv("TESTBUY_BASE", "BTC").upper().strip() or "BTC"
+        for q in ["USDC", "USDT"]:
+            symbols_to_try.append((_mk_symbol(base, q), 1.0, q))
+    elif len(context.args) == 2:
+        sym = context.args[0].upper().strip()
+        amt = _parse_float(context.args[1])
+        if not sym or amt is None or amt <= 0:
+            await update.message.reply_text("Uso: `/testbuy BTC-USDC 1`", parse_mode=ParseMode.MARKDOWN)
+            return
+        q = sym.split("-")[-1].upper() if "-" in sym else "QUOTE"
+        symbols_to_try.append((sym, float(amt), q))
+    elif len(context.args) >= 3:
+        base = context.args[0].upper().strip()
+        amt = _parse_float(context.args[1])
+        quote = context.args[2].upper().strip()
+        if not base or amt is None or amt <= 0 or not quote:
+            await update.message.reply_text("Uso: `/testbuy BTC 1 USDC`", parse_mode=ParseMode.MARKDOWN)
+            return
+        symbols_to_try.append((_mk_symbol(base, quote), float(amt), quote))
+
+    # Execute
+    lines = ["TEST BUY (live)"]
+    for sym, amt, q in symbols_to_try:
+        res = await asyncio.to_thread(live_exec.buy_quote, sym, amt)
+        if res.ok:
+            lines.append(f"- ✅ BUY ok: {sym} spent≈{amt:.2f} {q} price={res.fill_price if res.fill_price is not None else 'n/a'} order_id={res.order_id}")
+        else:
+            lines.append(f"- ❌ BUY failed: {sym} spent≈{amt:.2f} {q} error={res.error}")
+    await update.message.reply_text("\n".join(lines))
+
 async def cmd_bootstrap(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
     Force the "startup defaults" without relying on bootstrapped flag.
@@ -2033,6 +2105,7 @@ def build_app(cfg: AppConfig) -> Application:
     app.add_handler(CommandHandler("wallet", cmd_wallet))
     app.add_handler(CommandHandler("setmode", cmd_setmode))
     app.add_handler(CommandHandler("autotrade", cmd_autotrade))
+    app.add_handler(CommandHandler("testbuy", cmd_testbuy))
     app.add_handler(CommandHandler("bootstrap", cmd_bootstrap))
     app.add_handler(CommandHandler("reset", cmd_reset))
     app.add_handler(CommandHandler("setup", cmd_setup))

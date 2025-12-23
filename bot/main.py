@@ -139,6 +139,9 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "autotrade_mode": default_autotrade_mode,
         "entry_strategy": (os.getenv("AUTO_DEFAULTS_ENTRY_STRATEGY", "ranked") or "ranked").lower().strip(),
         "autotrade_cap_mode": (os.getenv("AUTO_DEFAULTS_CAP_MODE", "compound") or "compound").lower().strip(),
+        # Performance tuning defaults (allow ENV to win over stale DB defaults)
+        "pairs_limit": int(_parse_float(os.getenv("PAIRS_LIMIT", str(cfg.pairs_limit)) or str(cfg.pairs_limit)) or cfg.pairs_limit),
+        "scan_interval_seconds": int(_parse_float(os.getenv("SCAN_INTERVAL_SECONDS", str(cfg.scan_interval_seconds)) or str(cfg.scan_interval_seconds)) or cfg.scan_interval_seconds),
         # Default budget setup: use BOTH wallets (100 USDC + 100 USDT) unless overridden by ENV.
         # Single-quote fallback remains autotrade_max_quote/autotrade_quote_currency.
         "autotrade_max_quote": float(_parse_float(os.getenv("AUTO_DEFAULTS_CAP_AMT", "100") or "100") or 100.0),
@@ -1908,6 +1911,8 @@ def build_app(cfg: AppConfig) -> Application:
             "autotrade_mode": default_autotrade_mode,
             "entry_strategy": (os.getenv("AUTO_DEFAULTS_ENTRY_STRATEGY", "ranked") or "ranked").lower().strip(),
             "autotrade_cap_mode": (os.getenv("AUTO_DEFAULTS_CAP_MODE", "compound") or "compound").lower().strip(),
+            "pairs_limit": int(_parse_float(os.getenv("PAIRS_LIMIT", str(cfg.pairs_limit)) or str(cfg.pairs_limit)) or cfg.pairs_limit),
+            "scan_interval_seconds": int(_parse_float(os.getenv("SCAN_INTERVAL_SECONDS", str(cfg.scan_interval_seconds)) or str(cfg.scan_interval_seconds)) or cfg.scan_interval_seconds),
             "autotrade_max_quote": float(_parse_float(os.getenv("AUTO_DEFAULTS_CAP_AMT", "100") or "100") or 100.0),
             "autotrade_quote_currency": (os.getenv("AUTO_DEFAULTS_CAP_CUR", "USDC") or "USDC").upper().strip(),
             "autotrade_quote_currencies": (os.getenv("AUTO_DEFAULTS_CAP_CURS", "USDC,USDT") or "USDC,USDT").upper().strip(),

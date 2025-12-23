@@ -1169,54 +1169,99 @@ async def scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             last_mom15_sign: dict[str, int] = context.application.bot_data.setdefault("last_mom15_sign", {})
 
             autotrade_on = int(st.get("autotrade_enabled", 0)) == 1
-            quote_cur = str(st.get("autotrade_quote_currency", "USDT")).upper()
+            # Multi-quote support: use both wallets (e.g. USDC+USDT) if configured.
+            raw_quotes = str(st.get("autotrade_quote_currencies") or "").strip()
+            quotes: list[str] = []
+            if raw_quotes:
+                for q in raw_quotes.split(","):
+                    qq = q.strip().upper()
+                    if qq:
+                        quotes.append(qq)
+            if not quotes:
+                quotes = [str(st.get("autotrade_quote_currency", "USDT")).upper()]
+            # Prefer USDC first (user preference), then USDT, then others.
+            def _qrank(q: str) -> int:
+                if q == "USDC":
+                    return 0
+                if q == "USDT":
+                    return 1
+                return 2
+            quotes = sorted(list(dict.fromkeys(quotes)), key=_qrank)
+
             max_pos = int(st.get("autotrade_max_positions", 3))
             exec_mode = str(st.get("autotrade_mode", "paper")).lower()
             executor = live_exec if exec_mode == "live" else paper_exec
-            candidates: list[tuple[str, Any]] = []
-            # Effective cap (fixed/balance/compound).
+            candidates_by_quote: dict[str, list[tuple[str, Any]]] = {}
+            # Effective caps per quote (fixed/balance/compound).
             base_cap = float(st.get("autotrade_max_quote", 100.0))
             cap_mode = str(st.get("autotrade_cap_mode", "fixed")).lower().strip()
             if cap_mode not in ("fixed", "balance", "compound"):
                 cap_mode = "fixed"
-            avail = None
+
+            # Parse caps json if present (e.g. {"USDC":100,"USDT":100})
+            caps_map: dict[str, float] = {}
+            raw_caps = str(st.get("autotrade_caps_json") or "").strip()
+            if raw_caps:
+                try:
+                    obj = json.loads(raw_caps)
+                    if isinstance(obj, dict):
+                        for k, v in obj.items():
+                            kk = str(k).upper().strip()
+                            try:
+                                caps_map[kk] = float(v)
+                            except Exception:
+                                continue
+                except Exception:
+                    caps_map = {}
+            if not caps_map:
+                # Default: same base cap for all active quotes.
+                caps_map = {q: base_cap for q in quotes}
+
+            # Get live balances once (if live) and map available by currency.
+            avail_map: dict[str, float] = {}
             if exec_mode == "live":
                 balances = await asyncio.to_thread(rx.get_balances)
                 if isinstance(balances, list):
                     for row in balances:
                         if not isinstance(row, dict):
                             continue
-                        if str(row.get("currency", "")).upper() != quote_cur:
-                            continue
+                        cur = str(row.get("currency", "")).upper()
                         try:
-                            avail = float(row.get("available"))
+                            avail_map[cur] = float(row.get("available"))
                         except Exception:
-                            avail = None
-                        break
-            realized = 0.0
-            if cap_mode == "compound":
-                realized = await asyncio.to_thread(store.sum_realized_pnl_for_quote, quote_cur)
-                if realized < 0:
-                    realized = 0.0
-            quote_cap = base_cap
-            if cap_mode == "balance":
-                if avail is not None:
-                    quote_cap = min(base_cap, float(avail))
-            elif cap_mode == "compound":
-                quote_cap = base_cap + float(realized)
-                if avail is not None:
-                    quote_cap = min(quote_cap, float(avail))
+                            continue
+
+            effective_caps: dict[str, float] = {}
+            for q in quotes:
+                base_q_cap = float(caps_map.get(q, base_cap))
+                avail = avail_map.get(q)
+                realized = 0.0
+                if cap_mode == "compound":
+                    realized = await asyncio.to_thread(store.sum_realized_pnl_for_quote, q)
+                    if realized < 0:
+                        realized = 0.0
+                qcap = base_q_cap
+                if cap_mode == "balance":
+                    if avail is not None:
+                        qcap = min(base_q_cap, float(avail))
+                elif cap_mode == "compound":
+                    qcap = base_q_cap + float(realized)
+                    if avail is not None:
+                        qcap = min(qcap, float(avail))
+                effective_caps[q] = float(qcap)
+
             metrics["cap_mode"] = cap_mode
-            metrics["cap_effective"] = float(quote_cap)
-            metrics["cap_available"] = float(avail) if avail is not None else None
+            metrics["cap_effective"] = float(effective_caps.get(quotes[0], base_cap)) if quotes else float(base_cap)
+            metrics["cap_available"] = None
+            metrics["cap_effective_by_quote"] = dict(effective_caps)
+            metrics["cap_available_by_quote"] = dict(avail_map)
 
             # Cache for "is this tradable on Revolut X?" checks
             pair_cache: dict[str, Any] = context.application.bot_data.setdefault("revx_pair_cache", {})
             cache_ttl_seconds = int(os.getenv("REVX_PAIR_CACHE_TTL_SECONDS", "21600"))  # 6h
 
-            def _map_to_revx_symbol(market_symbol: str) -> str:
-                base = market_symbol.split("-")[0].upper()
-                return f"{base}-{quote_cur}"
+            def _base_from_market_symbol(market_symbol: str) -> str:
+                return market_symbol.split("-")[0].upper()
 
             async def _revx_pair_exists(symbol: str) -> bool:
                 now_ts = now.timestamp()
@@ -1317,9 +1362,17 @@ async def scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 
                     if entry:
                         metrics["scan_mom_hits"] = int(metrics.get("scan_mom_hits", 0)) + 1
-                        # Collect candidates for auto-buy (we'll take top N)
-                        revx_symbol = _map_to_revx_symbol(symbol)
-                        if await _revx_pair_exists(revx_symbol):
+                        # Multi-quote: try BASE-USDC then BASE-USDT (etc) and take first tradable.
+                        base = _base_from_market_symbol(symbol)
+                        revx_symbol = None
+                        revx_quote = None
+                        for q in quotes:
+                            cand = f"{base}-{q}"
+                            if await _revx_pair_exists(cand):
+                                revx_symbol = cand
+                                revx_quote = q
+                                break
+                        if revx_symbol and revx_quote:
                             metrics["scan_tradable_hits"] = int(metrics.get("scan_tradable_hits", 0)) + 1
                             # send signal only if tradable on Revolut X
                             now_ts = now.timestamp()
@@ -1339,7 +1392,8 @@ async def scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                                         parts.append(f"- momentum 1h: `{fmt_pct(entry.mom_1h)}`")
                                     if entry.mom_15m is not None:
                                         parts.append(f"- momentum 15m: `{fmt_pct(entry.mom_15m)}`")
-                                    parts.append(f"- cap totale: `{quote_cap:.2f} {quote_cur}`")
+                                    cap_here = float(effective_caps.get(revx_quote, base_cap))
+                                    parts.append(f"- cap totale: `{cap_here:.2f} {revx_quote}`")
                                     parts.append("")
                                     parts.append(f"_Motivo: {entry.reason}_")
                                     await context.application.bot.send_message(
@@ -1351,13 +1405,15 @@ async def scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                                     metrics["last_signal_ts"] = now_ts
 
                             if autotrade_on:
-                                candidates.append((revx_symbol, entry))
+                                candidates_by_quote.setdefault(revx_quote, []).append((revx_symbol, entry))
 
                     # Track sign of mom_15m (for reversal alerts on open positions)
                     mom_sign = 1 if mom.mom_15m > 0 else (-1 if mom.mom_15m < 0 else 0)
                     last_mom15_sign[symbol] = mom_sign
-                    # Also store with the Revolut-mapped symbol key for consistency with positions.
-                    last_mom15_sign[_map_to_revx_symbol(symbol)] = mom_sign
+                    # Also store for possible Revolut symbols across active quotes.
+                    base = _base_from_market_symbol(symbol)
+                    for q in quotes:
+                        last_mom15_sign[f"{base}-{q}"] = mom_sign
             except Exception as e:
                 metrics["scans_err"] = int(metrics.get("scans_err", 0)) + 1
                 metrics["last_error"] = f"scan loop error: {repr(e)}"
@@ -1365,20 +1421,23 @@ async def scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                 metrics["last_scan_completed"] = datetime.now(cfg.tz).timestamp()
                 return
 
-            # AUTO BUY: open up to max_pos positions, total exposure <= quote_cap.
-            if autotrade_on and candidates:
-                # Highest 15m momentum first
-                # Prefer momentum ranking if available, otherwise keep stable order.
+            # AUTO BUY: open up to max_pos positions per quote, total exposure <= cap per quote.
+            if autotrade_on and candidates_by_quote:
                 def _rank(item):
                     ent = item[1]
                     return float(ent.mom_15m) if getattr(ent, "mom_15m", None) is not None else 0.0
 
-                candidates.sort(key=_rank, reverse=True)
                 owner = await _get_owner_chat_id(context)
                 if owner is not None:
-                    for symbol, entry in candidates:
-                        open_notional = await asyncio.to_thread(total_open_notional, store, quote_cur)
-                        remaining = max(0.0, quote_cap - float(open_notional))
+                    for q in quotes:
+                        candidates = candidates_by_quote.get(q) or []
+                        if not candidates:
+                            continue
+                        candidates.sort(key=_rank, reverse=True)
+                        quote_cap = float(effective_caps.get(q, base_cap))
+                        for symbol, entry in candidates:
+                            open_notional = await asyncio.to_thread(total_open_notional, store, q)
+                            remaining = max(0.0, quote_cap - float(open_notional))
                         # For higher turnover, avoid "all-in" on the first trade:
                         # default spend = cap/max_positions, or override via ENV.
                         per_trade = _parse_float(os.getenv("AUTOTRADE_PER_TRADE_QUOTE", "0") or "0")
@@ -1387,7 +1446,7 @@ async def scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                             store=store,
                             symbol=symbol,
                             quote_cap_total=quote_cap,
-                            quote_currency=quote_cur,
+                            quote_currency=q,
                             min_trade_quote=10.0,
                             max_positions=max_pos,
                             per_trade_quote=per_trade_quote,
@@ -1399,18 +1458,18 @@ async def scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                             continue
                         res = await asyncio.to_thread(executor.buy_quote, symbol, spend)
                         if res.ok:
-                            metrics["last_trade_action"] = f"BUY {symbol} {spend:.2f} {quote_cur} ({exec_mode})"
+                            metrics["last_trade_action"] = f"BUY {symbol} {spend:.2f} {q} ({exec_mode})"
                             metrics["last_trade_ts"] = now.timestamp()
                             await context.application.bot.send_message(
                                 chat_id=owner,
                                 text=(
                                     "AUTO BUY\n"
                                     f"- symbol: {symbol}\n"
-                                    f"- spent: {spend:.2f} {quote_cur} (cap totale {quote_cap:.2f}, residuo pre-buy {remaining:.2f})\n"
+                                    f"- spent: {spend:.2f} {q} (cap totale {quote_cap:.2f}, residuo pre-buy {remaining:.2f})\n"
                                     f"- price: {res.fill_price if res.fill_price is not None else 'n/a'}\n"
                                     f"- strategy: {entry.kind}\n"
                                     f"- motivo: {entry.reason}\n"
-                                    f"- max_positions: {max_pos} cap totale={quote_cap:.2f} {quote_cur}\n"
+                                    f"- max_positions: {max_pos} cap totale={quote_cap:.2f} {q}\n"
                                     f"- order_id: {res.order_id}\n"
                                 ),
                             )
@@ -1419,7 +1478,7 @@ async def scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                             metrics["last_trade_ts"] = now.timestamp()
                             await context.application.bot.send_message(chat_id=owner, text=f"AUTO BUY FAILED\n- symbol: {symbol}\n- error: {res.error}")
                         # Stop if we've filled the cap or reached max positions
-                        open_notional2 = await asyncio.to_thread(total_open_notional, store, quote_cur)
+                        open_notional2 = await asyncio.to_thread(total_open_notional, store, q)
                         if open_notional2 >= quote_cap - 1e-6:
                             break
 

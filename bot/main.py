@@ -1190,8 +1190,10 @@ async def scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                         candidates.append((revx_symbol, entry))
 
             # Track sign of mom_15m (for reversal alerts on open positions)
-            mom_sign = 1 if sig.mom_15m > 0 else (-1 if sig.mom_15m < 0 else 0)
+            mom_sign = 1 if mom.mom_15m > 0 else (-1 if mom.mom_15m < 0 else 0)
             last_mom15_sign[symbol] = mom_sign
+            # Also store with the Revolut-mapped symbol key for consistency with positions.
+            last_mom15_sign[_map_to_revx_symbol(symbol)] = mom_sign
     except Exception as e:
         metrics["scans_err"] = int(metrics.get("scans_err", 0)) + 1
         metrics["last_error"] = f"scan loop error: {repr(e)}"

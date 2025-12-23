@@ -117,19 +117,26 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             return
 
     st = await asyncio.to_thread(store.get_settings)
-    # After /reset (bootstrapped=0), auto-apply defaults:
+    # Auto-defaults on /start (requested UX):
     # - risk normal
-    # - autotrade on
+    # - autotrade ON
     # - 24/7 (always)
     # - scanner active
-    if int(st.get("bootstrapped", 0)) == 0:
+    #
+    # Can be disabled via ENV: AUTO_DEFAULTS_ON_START=0
+    auto_defaults = os.getenv("AUTO_DEFAULTS_ON_START", "1") != "0"
+    desired_defaults: dict[str, Any] = {
+        "risk_mode": "normal",
+        "autotrade_enabled": 1,
+        "mode": "always",
+        "paused": 0,
+        "bootstrapped": 1,
+    }
+    needs_defaults = any(st.get(k) != v for k, v in desired_defaults.items())
+    if auto_defaults and needs_defaults:
         await asyncio.to_thread(
             store.update_settings,
-            risk_mode="normal",
-            autotrade_enabled=1,
-            mode="always",
-            paused=0,
-            bootstrapped=1,
+            **desired_defaults,
         )
         st = await asyncio.to_thread(store.get_settings)
     risk = RISK_PROFILES.get(st["risk_mode"], RISK_PROFILES["aggressive"])

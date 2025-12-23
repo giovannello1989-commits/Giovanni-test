@@ -6,6 +6,7 @@ import os
 import threading
 import base64
 import json
+import urllib.request
 from datetime import datetime, timezone
 from typing import Any
 
@@ -346,6 +347,30 @@ async def cmd_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     for av, cur in extra[:10]:
         lines.append(f"- {cur}: available={by_cur[cur].get('available')} reserved={by_cur[cur].get('reserved')}")
     await update.message.reply_text("\n".join(lines))
+
+
+async def cmd_egressip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /egressip
+    Shows the public outbound IP of the host running the bot (useful for IP whitelisting).
+    """
+    cfg: AppConfig = context.application.bot_data["cfg"]
+    if not _authorized(cfg, update):
+        return
+    owner = await _get_owner_chat_id(context)
+    chat = update.effective_chat
+    if owner is not None and chat and chat.id != owner:
+        return
+
+    def _fetch_ip() -> str:
+        try:
+            with urllib.request.urlopen("https://api.ipify.org", timeout=10) as r:
+                return r.read().decode("utf-8").strip()
+        except Exception as e:
+            return f"error: {repr(e)}"
+
+    ip = await asyncio.to_thread(_fetch_ip)
+    await update.message.reply_text(f"Egress IP (public): {ip}\n\nNota: su Railway l'IP può cambiare.")
 
 
 async def cmd_revxprobe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -2103,6 +2128,7 @@ def build_app(cfg: AppConfig) -> Application:
     app.add_handler(CommandHandler("revxprobe", cmd_revxprobe))
     app.add_handler(CommandHandler("revxpub", cmd_revxpub))
     app.add_handler(CommandHandler("wallet", cmd_wallet))
+    app.add_handler(CommandHandler("egressip", cmd_egressip))
     app.add_handler(CommandHandler("setmode", cmd_setmode))
     app.add_handler(CommandHandler("autotrade", cmd_autotrade))
     app.add_handler(CommandHandler("testbuy", cmd_testbuy))

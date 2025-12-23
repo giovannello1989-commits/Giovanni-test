@@ -278,6 +278,8 @@ async def _build_status_text(context: ContextTypes.DEFAULT_TYPE) -> str:
         f"- cap_mode: {st.get('autotrade_cap_mode', 'fixed')}\n"
         f"- cap_effective (last scan): {metrics.get('cap_effective') if metrics.get('cap_effective') is not None else 'n/a'}\n"
         f"- multi_quotes: {st.get('autotrade_quote_currencies') or 'n/a'}\n"
+        f"- multicaps: {st.get('autotrade_caps_json') or 'n/a'}\n"
+        f"- cap_effective_by_quote (last scan): {metrics.get('cap_effective_by_quote') if metrics.get('cap_effective_by_quote') is not None else 'n/a'}\n"
     )
     last_error = metrics.get("last_error")
     if last_error:
@@ -420,6 +422,8 @@ async def cmd_autotrade(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     /autotrade mode paper|live
     /autotrade cap 100 USDT
     /autotrade capmode fixed|balance|compound
+    /autotrade quotes USDC,USDT
+    /autotrade multicaps 100 USDC 100 USDT
     """
     cfg: AppConfig = context.application.bot_data["cfg"]
     if not _authorized(cfg, update):
@@ -438,7 +442,13 @@ async def cmd_autotrade(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             "- /autotrade mode paper|live\n"
             "- /autotrade cap 100 USDT\n"
             "- /autotrade capmode fixed|balance|compound\n\n"
-            f"Stato: enabled={bool(int(st.get('autotrade_enabled',0)))}, mode={st.get('autotrade_mode','paper')}, cap={st.get('autotrade_max_quote',100)} {st.get('autotrade_quote_currency','USDT')} capmode={st.get('autotrade_cap_mode','fixed')}"
+            "- /autotrade quotes USDC,USDT\n"
+            "- /autotrade multicaps 100 USDC 100 USDT\n\n"
+            f"Stato: enabled={bool(int(st.get('autotrade_enabled',0)))}, mode={st.get('autotrade_mode','paper')}, "
+            f"cap={st.get('autotrade_max_quote',100)} {st.get('autotrade_quote_currency','USDT')} "
+            f"capmode={st.get('autotrade_cap_mode','fixed')} "
+            f"multi_quotes={st.get('autotrade_quote_currencies') or 'n/a'} "
+            f"multicaps={st.get('autotrade_caps_json') or 'n/a'}"
         )
         return
 
@@ -500,7 +510,49 @@ async def cmd_autotrade(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await update.message.reply_text(f"OK. autotrade_cap_mode={m}.")
         return
 
-    await update.message.reply_text("Comando non riconosciuto. Usa: on|off|mode|cap|capmode")
+    if sub == "quotes":
+        if len(context.args) < 2:
+            await update.message.reply_text("Uso: `/autotrade quotes USDC,USDT`", parse_mode=ParseMode.MARKDOWN)
+            return
+        raw = context.args[1]
+        quotes = []
+        for q in raw.split(","):
+            qq = q.strip().upper()
+            if qq:
+                quotes.append(qq)
+        if not quotes:
+            await update.message.reply_text("Valore non valido. Esempio: USDC,USDT")
+            return
+        await asyncio.to_thread(store.update_settings, autotrade_quote_currencies=",".join(quotes))
+        await update.message.reply_text(f"OK. autotrade_quote_currencies={','.join(quotes)}")
+        return
+
+    if sub == "multicaps":
+        # Usage: /autotrade multicaps 100 USDC 100 USDT ...
+        if len(context.args) < 3 or (len(context.args) - 1) % 2 != 0:
+            await update.message.reply_text("Uso: `/autotrade multicaps 100 USDC 100 USDT`", parse_mode=ParseMode.MARKDOWN)
+            return
+        caps: dict[str, float] = {}
+        quotes: list[str] = []
+        i = 1
+        while i + 1 < len(context.args):
+            amt = _parse_float(context.args[i])
+            cur = str(context.args[i + 1]).upper().strip()
+            if amt is None or amt <= 0 or not cur:
+                await update.message.reply_text("Valori non validi. Esempio: `/autotrade multicaps 100 USDC 100 USDT`", parse_mode=ParseMode.MARKDOWN)
+                return
+            caps[cur] = float(amt)
+            quotes.append(cur)
+            i += 2
+        await asyncio.to_thread(
+            store.update_settings,
+            autotrade_caps_json=json.dumps(caps),
+            autotrade_quote_currencies=",".join(quotes),
+        )
+        await update.message.reply_text(f"OK. multicaps={caps} quotes={','.join(quotes)}")
+        return
+
+    await update.message.reply_text("Comando non riconosciuto. Usa: on|off|mode|cap|capmode|quotes|multicaps")
 
 async def cmd_bootstrap(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """

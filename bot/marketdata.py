@@ -118,6 +118,7 @@ class BinancePublicClient(MarketDataClient):
                         "high": float(row[2]),
                         "low": float(row[3]),
                         "close": float(row[4]),
+                        "volume": float(row[5]),
                     }
                 )
             except Exception:
@@ -133,6 +134,33 @@ class BinancePublicClient(MarketDataClient):
             except Exception:
                 return None
         return None
+
+    def get_top_movers(self, limit: int = 50) -> list[str]:
+        """
+        Returns the top positive 24h movers for this quote currency.
+        Uses /api/v3/ticker/24hr (public).
+        """
+        data = self._request_json("/api/v3/ticker/24hr")
+        if not isinstance(data, list):
+            return []
+        rows: list[tuple[float, str, str]] = []
+        for r in data:
+            if not isinstance(r, dict):
+                continue
+            sym = str(r.get("symbol", "")).upper()
+            if not sym.endswith(self.quote):
+                continue
+            try:
+                chg = float(r.get("priceChangePercent"))
+            except Exception:
+                continue
+            base = sym[: -len(self.quote)]
+            if not base:
+                continue
+            rows.append((chg, base, self.quote))
+        rows.sort(key=lambda x: x[0], reverse=True)
+        out = [self._to_dash_symbol(base, quote) for _, base, quote in rows[: max(1, int(limit))]]
+        return out
 
 
 class RevolutXMarketDataClient(MarketDataClient):

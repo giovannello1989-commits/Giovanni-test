@@ -125,13 +125,18 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     #
     # Can be disabled via ENV: AUTO_DEFAULTS_ON_START=0
     auto_defaults = os.getenv("AUTO_DEFAULTS_ON_START", "1") != "0"
+    # Safety: only default to LIVE if explicitly allowed via ENV.
+    allow_live = os.getenv("ALLOW_LIVE_TRADING", "0") == "1"
     default_autotrade_mode = (os.getenv("AUTO_DEFAULTS_AUTOTRADE_MODE", "live") or "live").lower().strip()
     if default_autotrade_mode not in ("paper", "live"):
         default_autotrade_mode = "live"
+    if default_autotrade_mode == "live" and not allow_live:
+        default_autotrade_mode = "paper"
     desired_defaults: dict[str, Any] = {
         "risk_mode": "normal",
         "autotrade_enabled": 1,
         "autotrade_mode": default_autotrade_mode,
+        "entry_strategy": (os.getenv("AUTO_DEFAULTS_ENTRY_STRATEGY", "ranked") or "ranked").lower().strip(),
         "mode": "always",
         "paused": 0,
         "bootstrapped": 1,
@@ -228,6 +233,9 @@ async def _build_status_text(context: ContextTypes.DEFAULT_TYPE) -> str:
         f"- last pairs count: {last_pairs_count if last_pairs_count is not None else 'n/a'}\n"
         f"- scans ok/err: {scans_ok}/{scans_err}\n"
         f"- last scan note: {metrics.get('last_scan_note') or 'n/a'}\n"
+        f"- universe: {metrics.get('scan_universe') or 'n/a'} scanned={metrics.get('scan_pairs_scanned') or 'n/a'}\n"
+        f"- mom hits: {metrics.get('scan_mom_hits') or 0} / tradable hits: {metrics.get('scan_tradable_hits') or 0}\n"
+        f"- best mom15 (seen): {fmt_pct(float(metrics.get('scan_best_mom15'))) if metrics.get('scan_best_mom15') is not None else 'n/a'} @ {metrics.get('scan_best_symbol') or 'n/a'}\n"
         "\n"
         "NOTIFICHE\n"
         f"- signals sent (runtime): {signals_sent}\n"
@@ -595,11 +603,11 @@ async def cmd_setentry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if owner is not None and chat and chat.id != owner:
         return
     if not context.args:
-        await update.message.reply_text("Uso: `/setentry momentum|breakout|dip`", parse_mode=ParseMode.MARKDOWN)
+        await update.message.reply_text("Uso: `/setentry momentum|ranked|breakout|dip`", parse_mode=ParseMode.MARKDOWN)
         return
     mode = context.args[0].lower().strip()
-    if mode not in ("momentum", "breakout", "dip"):
-        await update.message.reply_text("Valore non valido. Usa: momentum|breakout|dip")
+    if mode not in ("momentum", "ranked", "breakout", "dip"):
+        await update.message.reply_text("Valore non valido. Usa: momentum|ranked|breakout|dip")
         return
     store: Storage = context.application.bot_data["store"]
     await asyncio.to_thread(store.update_settings, entry_strategy=mode)
@@ -1098,8 +1106,16 @@ async def scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 
         try:
             # Load pairs from market data provider.
+            # If provider is Binance, we can optionally scan only "top movers" to find more opportunities.
+            scan_universe = (os.getenv("SCAN_UNIVERSE", "topmovers") or "topmovers").lower().strip()
+            pairs: list[str] = []
             try:
-                pairs = await asyncio.to_thread(md.get_pairs)
+                if scan_universe == "topmovers" and hasattr(md, "get_top_movers"):
+                    pairs = await asyncio.to_thread(getattr(md, "get_top_movers"), int(st.get("pairs_limit", cfg.pairs_limit)))
+                    metrics["scan_universe"] = "topmovers"
+                if not pairs:
+                    pairs = await asyncio.to_thread(md.get_pairs)
+                    metrics["scan_universe"] = "all"
             except Exception as e:
                 metrics["scans_err"] = int(metrics.get("scans_err", 0)) + 1
                 metrics["last_error"] = f"get_pairs error: {repr(e)}"
@@ -1156,6 +1172,11 @@ async def scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                 return symbol, mom, candles
 
             fetch_results = await asyncio.gather(*(_fetch(s) for s in pairs), return_exceptions=True)
+            metrics["scan_pairs_scanned"] = len(pairs)
+            metrics["scan_mom_hits"] = 0
+            metrics["scan_tradable_hits"] = 0
+            metrics["scan_best_mom15"] = None
+            metrics["scan_best_symbol"] = None
 
             # Scan momentum for candidate BUY signals
             try:
@@ -1165,6 +1186,14 @@ async def scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                     symbol, mom, candles = r
                     if not mom:
                         continue
+
+                    # Best-effort telemetry: track best 15m momentum seen.
+                    try:
+                        if metrics.get("scan_best_mom15") is None or float(mom.mom_15m) > float(metrics["scan_best_mom15"]):
+                            metrics["scan_best_mom15"] = float(mom.mom_15m)
+                            metrics["scan_best_symbol"] = symbol
+                    except Exception:
+                        pass
 
                     entry: EntrySignal | None = None
                     if entry_strategy == "momentum":
@@ -1176,6 +1205,24 @@ async def scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                                 mom_1h=mom.mom_1h,
                                 mom_15m=mom.mom_15m,
                                 reason=f"mom_1h {fmt_pct(mom.mom_1h)}≥{fmt_pct(risk.mom_1h_threshold)} AND mom_15m {fmt_pct(mom.mom_15m)}≥{fmt_pct(risk.mom_15m_threshold)}",
+                            )
+                    elif entry_strategy == "ranked":
+                        # "Ranked" momentum: lower thresholds + ranking.
+                        # Goal: generate more entries than strict 6%/3% momentum.
+                        if risk.name == "aggressive":
+                            min_1h, min_15m = 0.02, 0.012
+                        elif risk.name == "conservative":
+                            min_1h, min_15m = 0.01, 0.006
+                        else:
+                            min_1h, min_15m = 0.015, 0.008
+                        if mom.mom_1h >= min_1h and mom.mom_15m >= min_15m:
+                            entry = EntrySignal(
+                                kind="ranked",
+                                symbol=symbol,
+                                last_price=mom.last_price,
+                                mom_1h=mom.mom_1h,
+                                mom_15m=mom.mom_15m,
+                                reason=f"ranked momentum: mom_1h {fmt_pct(mom.mom_1h)}≥{fmt_pct(min_1h)} AND mom_15m {fmt_pct(mom.mom_15m)}≥{fmt_pct(min_15m)}",
                             )
                     elif entry_strategy == "breakout":
                         entry = compute_breakout_signal(symbol, candles, breakout_pct)
@@ -1202,9 +1249,11 @@ async def scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                             )
 
                     if entry:
+                        metrics["scan_mom_hits"] = int(metrics.get("scan_mom_hits", 0)) + 1
                         # Collect candidates for auto-buy (we'll take top N)
                         revx_symbol = _map_to_revx_symbol(symbol)
                         if await _revx_pair_exists(revx_symbol):
+                            metrics["scan_tradable_hits"] = int(metrics.get("scan_tradable_hits", 0)) + 1
                             # send signal only if tradable on Revolut X
                             now_ts = now.timestamp()
                             last_ts = float(last_signal_by_symbol.get(revx_symbol, 0.0))

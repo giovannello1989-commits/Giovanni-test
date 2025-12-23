@@ -1201,6 +1201,12 @@ async def scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             scan_universe = (os.getenv("SCAN_UNIVERSE", "topmovers") or "topmovers").lower().strip()
             pairs: list[str] = []
             try:
+                if scan_universe in ("revx", "revolutx"):
+                    # Scan only symbols that actually exist on Revolut X (fastest way to get tradable hits).
+                    # We infer tradable symbols from public last-trades.
+                    symbols = await asyncio.to_thread(rx.get_public_symbols)
+                    pairs = sorted(symbols)
+                    metrics["scan_universe"] = "revx"
                 if scan_universe == "topmovers" and hasattr(md, "get_top_movers"):
                     pairs = await asyncio.to_thread(getattr(md, "get_top_movers"), int(st.get("pairs_limit", cfg.pairs_limit)))
                     metrics["scan_universe"] = "topmovers"

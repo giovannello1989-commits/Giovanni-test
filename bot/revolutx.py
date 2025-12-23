@@ -396,6 +396,9 @@ class RevolutXClient:
         Revolut X REST: prefer public last-trades for price discovery.
         """
         data = self._public_get_json(self.endpoints.public_last_trades)
+        # Some deployments require signature even on "public" endpoints.
+        if data is None and self.auth_ready():
+            data = self._request_json("GET", self.endpoints.public_last_trades)
         if isinstance(data, dict) and isinstance(data.get("data"), list):
             for it in data["data"]:
                 if not isinstance(it, dict):
@@ -429,6 +432,9 @@ class RevolutXClient:
         returns rows including a 'symbol' field (e.g. BTC-USD, BTC-USDC).
         """
         data = self._public_get_json(self.endpoints.public_last_trades)
+        # Some deployments require signature even on "public" endpoints.
+        if data is None and self.auth_ready():
+            data = self._request_json("GET", self.endpoints.public_last_trades)
         items: list[Any] = []
         if isinstance(data, dict) and isinstance(data.get("data"), list):
             items = data["data"]

@@ -1223,10 +1223,17 @@ async def scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 
                 if scan_universe in ("revx", "revolutx"):
                     # Scan only symbols that actually exist on Revolut X and match our quote wallets.
-                    if "quotes" in locals() and isinstance(quotes, list) and quotes:
-                        pairs = sorted([s for s in revx_symbols if s.split("-")[-1].upper() in set(quotes)])
-                    else:
-                        pairs = sorted(list(revx_symbols))
+                    # Build quote list from settings (USDC/USDT) so we don't include pairs like *-USD.
+                    raw_q = str(st.get("autotrade_quote_currencies") or st.get("autotrade_quote_currency") or "").strip()
+                    qs: set[str] = set()
+                    if raw_q:
+                        for q in raw_q.split(","):
+                            qq = q.strip().upper()
+                            if qq:
+                                qs.add(qq)
+                    if not qs:
+                        qs = {"USDC", "USDT"}
+                    pairs = sorted([s for s in revx_symbols if s.split("-")[-1].upper() in qs])
                     metrics["scan_universe"] = "revx"
                     metrics["revx_public_symbols_count"] = len(revx_symbols)
                 if scan_universe == "topmovers" and hasattr(md, "get_top_movers"):

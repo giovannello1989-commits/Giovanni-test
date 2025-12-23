@@ -172,6 +172,25 @@ class RevolutXClient:
         base = self.base_url + ("" if not self.base_path else ("/" + self.base_path.strip("/")))
         return urljoin(base + "/", relative_path.lstrip("/"))
 
+    def _public_get_json(self, relative_path: str, params: dict[str, Any] | None = None) -> Any | None:
+        """
+        Public GET without auth/signature headers.
+        Some deployments are picky and may reject signed requests on public endpoints.
+        """
+        url = self._make_url(relative_path)
+        try:
+            resp = self.session.get(url, params=params, headers=self._headers(), timeout=self.timeout_seconds)
+            if resp.status_code >= 400:
+                logger.warning("Revolut X public API error %s for %s: %s", resp.status_code, url, resp.text[:300])
+                return None
+            try:
+                return resp.json()
+            except Exception:
+                return None
+        except Exception as e:
+            logger.warning("Revolut X public request failed: %s (%s)", url, repr(e))
+            return None
+
     def _request_json(
         self,
         method: str,
@@ -376,7 +395,7 @@ class RevolutXClient:
         """
         Revolut X REST: prefer public last-trades for price discovery.
         """
-        data = self._request_json("GET", self.endpoints.public_last_trades)
+        data = self._public_get_json(self.endpoints.public_last_trades)
         if isinstance(data, dict) and isinstance(data.get("data"), list):
             for it in data["data"]:
                 if not isinstance(it, dict):
@@ -409,7 +428,7 @@ class RevolutXClient:
         Uses the public endpoint /api/1.0/public/last-trades which in practice
         returns rows including a 'symbol' field (e.g. BTC-USD, BTC-USDC).
         """
-        data = self._request_json("GET", self.endpoints.public_last_trades)
+        data = self._public_get_json(self.endpoints.public_last_trades)
         items: list[Any] = []
         if isinstance(data, dict) and isinstance(data.get("data"), list):
             items = data["data"]

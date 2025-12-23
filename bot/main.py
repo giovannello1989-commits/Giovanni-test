@@ -258,6 +258,8 @@ async def _build_status_text(context: ContextTypes.DEFAULT_TYPE) -> str:
         f"- universe: {metrics.get('scan_universe') or 'n/a'} scanned={metrics.get('scan_pairs_scanned') or 'n/a'}\n"
         f"- mom hits: {metrics.get('scan_mom_hits') or 0} / tradable hits: {metrics.get('scan_tradable_hits') or 0}\n"
         f"- best mom15 (seen): {fmt_pct(float(metrics.get('scan_best_mom15'))) if metrics.get('scan_best_mom15') is not None else 'n/a'} @ {metrics.get('scan_best_symbol') or 'n/a'}\n"
+        f"- SCAN_UNIVERSE env: {os.getenv('SCAN_UNIVERSE','<unset>')}\n"
+        f"- revx public symbols (cached): {len((context.application.bot_data.get('revx_public_symbols_cache', {}) or {}).get('data') or [])}\n"
         "\n"
         "NOTIFICHE\n"
         f"- signals sent (runtime): {signals_sent}\n"

@@ -449,7 +449,15 @@ class RevolutXClient:
             sym = it.get("symbol")
             if sym:
                 out.add(str(sym).upper())
-        return out
+        if out:
+            return out
+
+        # Fallback: some accounts don't expose last-trades list, but do expose configuration pairs.
+        try:
+            pairs = self.get_currency_pairs()
+            return {p.upper() for p in pairs if isinstance(p, str) and p}
+        except Exception:
+            return set()
 
     # --- Optional private read-only endpoints (only if API supports them) ---
     def get_balances(self) -> Any | None:

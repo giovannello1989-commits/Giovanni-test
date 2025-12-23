@@ -1594,8 +1594,8 @@ async def scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                         else:
                             metrics["last_trade_action"] = f"BUY FAILED {symbol} ({exec_mode})"
                             metrics["last_trade_ts"] = now.timestamp()
-                    metrics["last_error"] = f"last trade error: {res.error}"
-                    await context.application.bot.send_message(chat_id=owner, text=f"AUTO BUY FAILED\n- symbol: {symbol}\n- error: {res.error}")
+                            metrics["last_error"] = f"last trade error: {res.error}"
+                            await context.application.bot.send_message(chat_id=owner, text=f"AUTO BUY FAILED\n- symbol: {symbol}\n- error: {res.error}")
                         # Stop if we've filled the cap or reached max positions
                         open_notional2 = await asyncio.to_thread(total_open_notional, store, q)
                         if open_notional2 >= quote_cap - 1e-6:

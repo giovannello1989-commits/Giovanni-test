@@ -5,6 +5,7 @@ import logging
 import os
 import threading
 import base64
+import json
 from datetime import datetime, timezone
 from typing import Any
 
@@ -138,9 +139,12 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "autotrade_mode": default_autotrade_mode,
         "entry_strategy": (os.getenv("AUTO_DEFAULTS_ENTRY_STRATEGY", "ranked") or "ranked").lower().strip(),
         "autotrade_cap_mode": (os.getenv("AUTO_DEFAULTS_CAP_MODE", "compound") or "compound").lower().strip(),
-        # Default budget & quote currency (your setup: 100 USDC)
+        # Default budget setup: use BOTH wallets (100 USDC + 100 USDT) unless overridden by ENV.
+        # Single-quote fallback remains autotrade_max_quote/autotrade_quote_currency.
         "autotrade_max_quote": float(_parse_float(os.getenv("AUTO_DEFAULTS_CAP_AMT", "100") or "100") or 100.0),
         "autotrade_quote_currency": (os.getenv("AUTO_DEFAULTS_CAP_CUR", "USDC") or "USDC").upper().strip(),
+        "autotrade_quote_currencies": (os.getenv("AUTO_DEFAULTS_CAP_CURS", "USDC,USDT") or "USDC,USDT").upper().strip(),
+        "autotrade_caps_json": (os.getenv("AUTO_DEFAULTS_CAPS_JSON", "") or "").strip() or json.dumps({"USDC": 100.0, "USDT": 100.0}),
         "mode": "always",
         "paused": 0,
         "bootstrapped": 1,

@@ -403,6 +403,27 @@ class RevolutXClient:
                         return None
         return None
 
+    def get_public_symbols(self) -> set[str]:
+        """
+        Best-effort way to list tradable symbols/pairs.
+        Uses the public endpoint /api/1.0/public/last-trades which in practice
+        returns rows including a 'symbol' field (e.g. BTC-USD, BTC-USDC).
+        """
+        data = self._request_json("GET", self.endpoints.public_last_trades)
+        items: list[Any] = []
+        if isinstance(data, dict) and isinstance(data.get("data"), list):
+            items = data["data"]
+        elif isinstance(data, list):
+            items = data
+        out: set[str] = set()
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            sym = it.get("symbol")
+            if sym:
+                out.add(str(sym).upper())
+        return out
+
     # --- Optional private read-only endpoints (only if API supports them) ---
     def get_balances(self) -> Any | None:
         return self._request_json("GET", self.endpoints.balances)

@@ -125,9 +125,13 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     #
     # Can be disabled via ENV: AUTO_DEFAULTS_ON_START=0
     auto_defaults = os.getenv("AUTO_DEFAULTS_ON_START", "1") != "0"
+    default_autotrade_mode = (os.getenv("AUTO_DEFAULTS_AUTOTRADE_MODE", "live") or "live").lower().strip()
+    if default_autotrade_mode not in ("paper", "live"):
+        default_autotrade_mode = "live"
     desired_defaults: dict[str, Any] = {
         "risk_mode": "normal",
         "autotrade_enabled": 1,
+        "autotrade_mode": default_autotrade_mode,
         "mode": "always",
         "paused": 0,
         "bootstrapped": 1,

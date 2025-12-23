@@ -1198,7 +1198,8 @@ async def scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
         try:
             # Load pairs from market data provider.
             # If provider is Binance, we can optionally scan only "top movers" to find more opportunities.
-            scan_universe = (os.getenv("SCAN_UNIVERSE", "topmovers") or "topmovers").lower().strip()
+            # Default to Revolut-X-only universe so we don't chase Binance-only coins.
+            scan_universe = (os.getenv("SCAN_UNIVERSE", "revx") or "revx").lower().strip()
             pairs: list[str] = []
             try:
                 if scan_universe in ("revx", "revolutx"):
@@ -1843,6 +1844,39 @@ def build_app(cfg: AppConfig) -> Application:
     store = Storage(cfg.db_path)
     # Bootstrap RevolutX base url/path from settings if present (non-secrets)
     st = store.get_settings()
+
+    # Apply default settings at process start (not only on /start), so a fresh restart
+    # immediately becomes "operational" even before you send commands.
+    # Can be disabled via ENV: AUTO_DEFAULTS_ON_BOOT=0
+    if os.getenv("AUTO_DEFAULTS_ON_BOOT", "1") != "0":
+        allow_live = os.getenv("ALLOW_LIVE_TRADING", "0") == "1"
+        default_autotrade_mode = (os.getenv("AUTO_DEFAULTS_AUTOTRADE_MODE", "live") or "live").lower().strip()
+        if default_autotrade_mode not in ("paper", "live"):
+            default_autotrade_mode = "live"
+        if default_autotrade_mode == "live" and not allow_live:
+            default_autotrade_mode = "paper"
+        desired_defaults: dict[str, Any] = {
+            "risk_mode": "normal",
+            "autotrade_enabled": 1,
+            "autotrade_mode": default_autotrade_mode,
+            "entry_strategy": (os.getenv("AUTO_DEFAULTS_ENTRY_STRATEGY", "ranked") or "ranked").lower().strip(),
+            "autotrade_cap_mode": (os.getenv("AUTO_DEFAULTS_CAP_MODE", "compound") or "compound").lower().strip(),
+            "autotrade_max_quote": float(_parse_float(os.getenv("AUTO_DEFAULTS_CAP_AMT", "100") or "100") or 100.0),
+            "autotrade_quote_currency": (os.getenv("AUTO_DEFAULTS_CAP_CUR", "USDC") or "USDC").upper().strip(),
+            "autotrade_quote_currencies": (os.getenv("AUTO_DEFAULTS_CAP_CURS", "USDC,USDT") or "USDC,USDT").upper().strip(),
+            "autotrade_caps_json": (os.getenv("AUTO_DEFAULTS_CAPS_JSON", "") or "").strip() or json.dumps({"USDC": 100.0, "USDT": 100.0}),
+            "mode": "always",
+            "paused": 0,
+            "bootstrapped": 1,
+        }
+        try:
+            needs = any(st.get(k) != v for k, v in desired_defaults.items())
+            if needs:
+                store.update_settings(**desired_defaults)
+                st = store.get_settings()
+        except Exception:
+            # Never block startup on defaults; bot can still be controlled via commands.
+            st = store.get_settings()
 
     # Optional auto-start configuration via ENV (so you don't need manual commands).
     # Applied at process start (after redeploy).

@@ -176,9 +176,11 @@ class LiveRevolutXExecutor:
     def buy_quote(self, symbol: str, quote_amount: float) -> ExecResult:
         client_oid = f"auto-{uuid.uuid4().hex[:12]}"
         # Use quote_size (spend quote currency amount) as per Revolut X docs.
-        data = self.rx.place_order(symbol=symbol, side="buy", client_order_id=client_oid, market_quote_size=f"{quote_amount:.8f}")
+        data = self.rx.place_order(symbol=symbol, side="BUY", client_order_id=client_oid, market_quote_size=f"{quote_amount:.8f}")
         if not data:
-            return ExecResult(False, None, None, "place_order returned null (check endpoint/payload/auth)")
+            return ExecResult(False, None, None, "place_order returned null (no response)")
+        if isinstance(data, dict) and data.get("_error"):
+            return ExecResult(False, None, None, f"place_order failed: HTTP {data.get('status')}: {str(data.get('data'))[:400]}")
         order_id = None
         for k in ("orderId", "id", "order_id"):
             if isinstance(data, dict) and data.get(k):
@@ -205,9 +207,11 @@ class LiveRevolutXExecutor:
         if base_av is None or base_av <= 0:
             return ExecResult(False, None, None, f"no available balance for {base}")
         client_oid = f"auto-{uuid.uuid4().hex[:12]}"
-        data = self.rx.place_order(symbol=symbol, side="sell", client_order_id=client_oid, market_base_size=f"{base_av:.8f}")
+        data = self.rx.place_order(symbol=symbol, side="SELL", client_order_id=client_oid, market_base_size=f"{base_av:.8f}")
         if not data:
-            return ExecResult(False, None, None, "place_order returned null (check endpoint/payload/auth)")
+            return ExecResult(False, None, None, "place_order returned null (no response)")
+        if isinstance(data, dict) and data.get("_error"):
+            return ExecResult(False, None, None, f"place_order failed: HTTP {data.get('status')}: {str(data.get('data'))[:400]}")
         order_id = None
         for k in ("orderId", "id", "order_id"):
             if isinstance(data, dict) and data.get(k):

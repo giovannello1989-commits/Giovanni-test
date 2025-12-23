@@ -556,13 +556,25 @@ class RevolutXClient:
             market["base_size"] = market_base_size
         if market_quote_size is not None:
             market["quote_size"] = market_quote_size
+        # Docs examples use uppercase BUY/SELL.
+        side_norm = str(side).upper().strip()
+        if side_norm not in ("BUY", "SELL"):
+            # Allow "buy"/"sell" inputs as well.
+            side_norm = "BUY" if str(side).lower().strip() == "buy" else ("SELL" if str(side).lower().strip() == "sell" else side_norm)
+
         payload: dict[str, Any] = {
             "client_order_id": client_order_id,
             "symbol": symbol,
-            "side": side.lower(),
+            "side": side_norm,
             "order_configuration": {"market": market},
         }
-        return self._request_json("POST", self.endpoints.place_order, json_body=payload)
+        # For trading we want the error payload too (not just None).
+        status, data = self._request("POST", self.endpoints.place_order, json_body=payload, retries=0)
+        if status is None:
+            return {"_error": True, "status": None, "data": None}
+        if status >= 400:
+            return {"_error": True, "status": status, "data": data}
+        return data
 
     def get_active_orders(self) -> Any | None:
         return self._request_json("GET", self.endpoints.active_orders)

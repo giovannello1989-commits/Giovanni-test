@@ -1312,6 +1312,10 @@ async def scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                     for symbol, entry in candidates:
                         open_notional = await asyncio.to_thread(total_open_notional, store, quote_cur)
                         remaining = max(0.0, quote_cap - float(open_notional))
+                        # For higher turnover, avoid "all-in" on the first trade:
+                        # default spend = cap/max_positions, or override via ENV.
+                        per_trade = _parse_float(os.getenv("AUTOTRADE_PER_TRADE_QUOTE", "0") or "0")
+                        per_trade_quote = per_trade if per_trade and per_trade > 0 else None
                         decision = decide_autobuy(
                             store=store,
                             symbol=symbol,
@@ -1319,6 +1323,7 @@ async def scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                             quote_currency=quote_cur,
                             min_trade_quote=10.0,
                             max_positions=max_pos,
+                            per_trade_quote=per_trade_quote,
                         )
                         if decision.action != "BUY" or not decision.quote_amount:
                             continue
@@ -1360,6 +1365,69 @@ async def scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
                     last_price = await asyncio.to_thread(md.get_last_price, p.symbol)
                 if last_price is None:
                     continue
+
+                # If autotrade enabled, allow "take profit" to increase turnover.
+                take_profit_pct = _parse_float(os.getenv("TAKE_PROFIT_PCT", "0.012") or "0.012") or 0.012
+                max_hold_min = int(_parse_float(os.getenv("MAX_HOLD_MINUTES", "180") or "180") or 180)
+                try:
+                    opened = datetime.fromisoformat(p.opened_ts_utc.replace("Z", "+00:00"))
+                except Exception:
+                    opened = None
+                hold_minutes = None
+                if opened is not None:
+                    hold_minutes = (datetime.now(timezone.utc) - opened).total_seconds() / 60.0
+                # Take profit
+                if int(st.get("autotrade_enabled", 0)) == 1 and p.avg_entry > 0 and last_price >= p.avg_entry * (1.0 + float(take_profit_pct)):
+                    owner = await _get_owner_chat_id(context)
+                    if owner is not None:
+                        exec_mode = str(st.get("autotrade_mode", "paper")).lower()
+                        ex = live_exec if exec_mode == "live" else paper_exec
+                        res = await asyncio.to_thread(ex.sell_all, p.symbol)
+                        if res.ok:
+                            pnl_quote = (last_price - p.avg_entry) * p.qty
+                            pct = ((last_price - p.avg_entry) / p.avg_entry) if p.avg_entry else 0.0
+                            metrics["last_trade_action"] = f"SELL {p.symbol} ({exec_mode}) take-profit pnl≈{pnl_quote:+.2f}"
+                            metrics["last_trade_ts"] = now.timestamp()
+                            await context.application.bot.send_message(
+                                chat_id=owner,
+                                text=(
+                                    "AUTO SELL (take profit)\n"
+                                    f"- symbol: {p.symbol}\n"
+                                    f"- last: {last_price:.8g}\n"
+                                    f"- entry: {p.avg_entry:.8g}\n"
+                                    f"- pnl≈ {pnl_quote:+.2f} ({pct*100:+.2f}%)\n"
+                                    f"- reason: last >= entry*(1+{take_profit_pct*100:.2f}%)\n"
+                                    f"- order_id: {res.order_id}\n"
+                                ),
+                            )
+                            continue
+
+                # Time exit (recycle capital if nothing happens)
+                if int(st.get("autotrade_enabled", 0)) == 1 and hold_minutes is not None and hold_minutes >= float(max_hold_min):
+                    owner = await _get_owner_chat_id(context)
+                    if owner is not None:
+                        exec_mode = str(st.get("autotrade_mode", "paper")).lower()
+                        ex = live_exec if exec_mode == "live" else paper_exec
+                        res = await asyncio.to_thread(ex.sell_all, p.symbol)
+                        if res.ok:
+                            pnl_quote = (last_price - p.avg_entry) * p.qty
+                            pct = ((last_price - p.avg_entry) / p.avg_entry) if p.avg_entry else 0.0
+                            metrics["last_trade_action"] = f"SELL {p.symbol} ({exec_mode}) time-exit pnl≈{pnl_quote:+.2f}"
+                            metrics["last_trade_ts"] = now.timestamp()
+                            await context.application.bot.send_message(
+                                chat_id=owner,
+                                text=(
+                                    "AUTO SELL (time exit)\n"
+                                    f"- symbol: {p.symbol}\n"
+                                    f"- last: {last_price:.8g}\n"
+                                    f"- entry: {p.avg_entry:.8g}\n"
+                                    f"- held: {hold_minutes:.1f} min\n"
+                                    f"- pnl≈ {pnl_quote:+.2f} ({pct*100:+.2f}%)\n"
+                                    f"- reason: held >= {max_hold_min} min\n"
+                                    f"- order_id: {res.order_id}\n"
+                                ),
+                            )
+                            continue
 
                 # Update peak
                 if last_price > p.peak_price:

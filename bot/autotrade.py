@@ -60,6 +60,7 @@ def decide_autobuy(
     quote_currency: str,
     min_trade_quote: float = 10.0,
     max_positions: int = 3,
+    per_trade_quote: float | None = None,
 ) -> AutoTradeDecision:
     """
     Risk rule:
@@ -81,7 +82,23 @@ def decide_autobuy(
     if remaining < float(min_trade_quote):
         return AutoTradeDecision(action="SKIP", symbol=symbol, reason="cap reached / remaining too small")
 
-    return AutoTradeDecision(action="BUY", symbol=symbol, quote_amount=remaining, reason=f"buy (cap remaining {remaining:.2f})")
+    # Position sizing:
+    # - If per_trade_quote is provided, use it (capped by remaining).
+    # - Else default to splitting the cap across max_positions (capped by remaining).
+    target = None
+    if per_trade_quote is not None:
+        try:
+            if float(per_trade_quote) > 0:
+                target = float(per_trade_quote)
+        except Exception:
+            target = None
+    if target is None:
+        target = float(quote_cap_total) / max(1, int(max_positions))
+
+    spend = min(float(remaining), float(target))
+    if spend < float(min_trade_quote):
+        return AutoTradeDecision(action="SKIP", symbol=symbol, reason="per-trade size too small")
+    return AutoTradeDecision(action="BUY", symbol=symbol, quote_amount=spend, reason=f"buy sized {spend:.2f} (remaining {remaining:.2f})")
 
 
 def decide_autosell_all(symbol: str, reason: str) -> AutoTradeDecision:

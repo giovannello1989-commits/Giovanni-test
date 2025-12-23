@@ -27,13 +27,14 @@ DEFAULT_SETTINGS = {
     "autotrade_mode": "paper",
     # Hard cap in quote currency (e.g., 100 USDT)
     "autotrade_max_quote": 100.0,
-    "autotrade_quote_currency": "USDT",
+    "autotrade_quote_currency": "USDC",
     "autotrade_max_positions": 3,
     # Multi-quote caps (optional):
     # - autotrade_quote_currencies: comma-separated list, e.g. "USDC,USDT"
     # - autotrade_caps_json: JSON object mapping quote->cap, e.g. {"USDC":100,"USDT":100}
-    "autotrade_quote_currencies": "",
-    "autotrade_caps_json": "",
+    # Default: ONLY USDC (many accounts don't have USDT pairs like BTC-USDT)
+    "autotrade_quote_currencies": "USDC",
+    "autotrade_caps_json": "{\"USDC\":100.0}",
     # How to interpret autotrade_max_quote:
     # - fixed: hard cap (default)
     # - balance: min(cap, available balance)

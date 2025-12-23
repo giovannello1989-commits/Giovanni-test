@@ -29,6 +29,11 @@ DEFAULT_SETTINGS = {
     "autotrade_max_quote": 100.0,
     "autotrade_quote_currency": "USDT",
     "autotrade_max_positions": 3,
+    # How to interpret autotrade_max_quote:
+    # - fixed: hard cap (default)
+    # - balance: min(cap, available balance)
+    # - compound: cap + realized profits (still capped by available balance in live mode)
+    "autotrade_cap_mode": "fixed",
     # Market data (signals)
     "market_data_provider": "binance",
     "market_data_quote": "USDT",
@@ -165,6 +170,7 @@ class Storage:
             _ensure_col("autotrade_max_quote", "autotrade_max_quote REAL NOT NULL DEFAULT 100.0", DEFAULT_SETTINGS["autotrade_max_quote"])
             _ensure_col("autotrade_quote_currency", "autotrade_quote_currency TEXT NOT NULL DEFAULT 'USDT'", DEFAULT_SETTINGS["autotrade_quote_currency"])
             _ensure_col("autotrade_max_positions", "autotrade_max_positions INTEGER NOT NULL DEFAULT 3", DEFAULT_SETTINGS["autotrade_max_positions"])
+            _ensure_col("autotrade_cap_mode", "autotrade_cap_mode TEXT NOT NULL DEFAULT 'fixed'", DEFAULT_SETTINGS["autotrade_cap_mode"])
             _ensure_col("market_data_provider", "market_data_provider TEXT NOT NULL DEFAULT 'binance'", DEFAULT_SETTINGS["market_data_provider"])
             _ensure_col("market_data_quote", "market_data_quote TEXT NOT NULL DEFAULT 'USDT'", DEFAULT_SETTINGS["market_data_quote"])
             _ensure_col("bootstrapped", "bootstrapped INTEGER NOT NULL DEFAULT 0", DEFAULT_SETTINGS["bootstrapped"])
@@ -209,6 +215,7 @@ class Storage:
             "autotrade_max_quote",
             "autotrade_quote_currency",
             "autotrade_max_positions",
+            "autotrade_cap_mode",
             "market_data_provider",
             "market_data_quote",
             "bootstrapped",
@@ -242,6 +249,7 @@ class Storage:
                     autotrade_max_quote=?,
                     autotrade_quote_currency=?,
                     autotrade_max_positions=?,
+                    autotrade_cap_mode=?,
                     market_data_provider=?,
                     market_data_quote=?,
                     bootstrapped=?,
@@ -266,6 +274,7 @@ class Storage:
                     DEFAULT_SETTINGS["autotrade_max_quote"],
                     DEFAULT_SETTINGS["autotrade_quote_currency"],
                     DEFAULT_SETTINGS["autotrade_max_positions"],
+                    DEFAULT_SETTINGS["autotrade_cap_mode"],
                     DEFAULT_SETTINGS["market_data_provider"],
                     DEFAULT_SETTINGS["market_data_quote"],
                     DEFAULT_SETTINGS["bootstrapped"],
@@ -274,6 +283,30 @@ class Storage:
                     DEFAULT_SETTINGS["dip_pct"],
                 ),
             )
+
+    def sum_realized_pnl_for_quote(self, quote_currency: str) -> float:
+        """
+        Sum realized PnL for SELL trades for symbols with the given quote currency.
+        Best-effort (relies on symbol format BASE-QUOTE).
+        """
+        q = (quote_currency or "").upper().strip()
+        if not q:
+            return 0.0
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT COALESCE(SUM(realized_pnl), 0.0) AS s
+                FROM trades
+                WHERE side='SELL'
+                  AND realized_pnl IS NOT NULL
+                  AND UPPER(symbol) LIKE ?
+                """,
+                (f"%-{q}",),
+            ).fetchone()
+            try:
+                return float(row["s"]) if row is not None else 0.0
+            except Exception:
+                return 0.0
 
     # --- Onboarding (setup wizard) ---
     def get_onboarding(self) -> dict:

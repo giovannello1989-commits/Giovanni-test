@@ -137,6 +137,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "autotrade_enabled": 1,
         "autotrade_mode": default_autotrade_mode,
         "entry_strategy": (os.getenv("AUTO_DEFAULTS_ENTRY_STRATEGY", "ranked") or "ranked").lower().strip(),
+        "autotrade_cap_mode": (os.getenv("AUTO_DEFAULTS_CAP_MODE", "compound") or "compound").lower().strip(),
         "mode": "always",
         "paused": 0,
         "bootstrapped": 1,
@@ -259,6 +260,8 @@ async def _build_status_text(context: ContextTypes.DEFAULT_TYPE) -> str:
         f"- enabled: {bool(int(st.get('autotrade_enabled', 0)))}\n"
         f"- mode: {st.get('autotrade_mode', 'paper')}\n"
         f"- cap: {st.get('autotrade_max_quote', 100.0)} {st.get('autotrade_quote_currency', 'USDT')}\n"
+        f"- cap_mode: {st.get('autotrade_cap_mode', 'fixed')}\n"
+        f"- cap_effective (last scan): {metrics.get('cap_effective') if metrics.get('cap_effective') is not None else 'n/a'}\n"
     )
     last_error = metrics.get("last_error")
     if last_error:
@@ -400,6 +403,7 @@ async def cmd_autotrade(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     /autotrade on|off
     /autotrade mode paper|live
     /autotrade cap 100 USDT
+    /autotrade capmode fixed|balance|compound
     """
     cfg: AppConfig = context.application.bot_data["cfg"]
     if not _authorized(cfg, update):
@@ -416,8 +420,9 @@ async def cmd_autotrade(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             "Uso:\n"
             "- /autotrade on|off\n"
             "- /autotrade mode paper|live\n"
-            "- /autotrade cap 100 USDT\n\n"
-            f"Stato: enabled={bool(int(st.get('autotrade_enabled',0)))}, mode={st.get('autotrade_mode','paper')}, cap={st.get('autotrade_max_quote',100)} {st.get('autotrade_quote_currency','USDT')}"
+            "- /autotrade cap 100 USDT\n"
+            "- /autotrade capmode fixed|balance|compound\n\n"
+            f"Stato: enabled={bool(int(st.get('autotrade_enabled',0)))}, mode={st.get('autotrade_mode','paper')}, cap={st.get('autotrade_max_quote',100)} {st.get('autotrade_quote_currency','USDT')} capmode={st.get('autotrade_cap_mode','fixed')}"
         )
         return
 
@@ -467,7 +472,19 @@ async def cmd_autotrade(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await update.message.reply_text(f"OK. Cap autotrade: {amt:.2f} {cur}.")
         return
 
-    await update.message.reply_text("Comando non riconosciuto. Usa: on|off|mode|cap")
+    if sub == "capmode":
+        if len(context.args) < 2:
+            await update.message.reply_text("Uso: `/autotrade capmode fixed|balance|compound`", parse_mode=ParseMode.MARKDOWN)
+            return
+        m = context.args[1].lower().strip()
+        if m not in ("fixed", "balance", "compound"):
+            await update.message.reply_text("Valore non valido. Usa: fixed|balance|compound")
+            return
+        await asyncio.to_thread(store.update_settings, autotrade_cap_mode=m)
+        await update.message.reply_text(f"OK. autotrade_cap_mode={m}.")
+        return
+
+    await update.message.reply_text("Comando non riconosciuto. Usa: on|off|mode|cap|capmode")
 
 async def cmd_bootstrap(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
@@ -1136,12 +1153,46 @@ async def scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
             last_mom15_sign: dict[str, int] = context.application.bot_data.setdefault("last_mom15_sign", {})
 
             autotrade_on = int(st.get("autotrade_enabled", 0)) == 1
-            quote_cap = float(st.get("autotrade_max_quote", 100.0))
             quote_cur = str(st.get("autotrade_quote_currency", "USDT")).upper()
             max_pos = int(st.get("autotrade_max_positions", 3))
             exec_mode = str(st.get("autotrade_mode", "paper")).lower()
             executor = live_exec if exec_mode == "live" else paper_exec
             candidates: list[tuple[str, Any]] = []
+            # Effective cap (fixed/balance/compound).
+            base_cap = float(st.get("autotrade_max_quote", 100.0))
+            cap_mode = str(st.get("autotrade_cap_mode", "fixed")).lower().strip()
+            if cap_mode not in ("fixed", "balance", "compound"):
+                cap_mode = "fixed"
+            avail = None
+            if exec_mode == "live":
+                balances = await asyncio.to_thread(rx.get_balances)
+                if isinstance(balances, list):
+                    for row in balances:
+                        if not isinstance(row, dict):
+                            continue
+                        if str(row.get("currency", "")).upper() != quote_cur:
+                            continue
+                        try:
+                            avail = float(row.get("available"))
+                        except Exception:
+                            avail = None
+                        break
+            realized = 0.0
+            if cap_mode == "compound":
+                realized = await asyncio.to_thread(store.sum_realized_pnl_for_quote, quote_cur)
+                if realized < 0:
+                    realized = 0.0
+            quote_cap = base_cap
+            if cap_mode == "balance":
+                if avail is not None:
+                    quote_cap = min(base_cap, float(avail))
+            elif cap_mode == "compound":
+                quote_cap = base_cap + float(realized)
+                if avail is not None:
+                    quote_cap = min(quote_cap, float(avail))
+            metrics["cap_mode"] = cap_mode
+            metrics["cap_effective"] = float(quote_cap)
+            metrics["cap_available"] = float(avail) if avail is not None else None
 
             # Cache for "is this tradable on Revolut X?" checks
             pair_cache: dict[str, Any] = context.application.bot_data.setdefault("revx_pair_cache", {})

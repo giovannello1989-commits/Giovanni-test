@@ -1,0 +1,2249 @@
+from __future__ import annotations
+
+import asyncio
+import logging
+import os
+import threading
+import base64
+import json
+import urllib.request
+from datetime import datetime, timezone
+from typing import Any
+
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.constants import ParseMode
+from telegram.ext import (
+    Application,
+    CallbackQueryHandler,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
+
+from bot.config import RISK_PROFILES, AppConfig, is_within_operating_window, load_config
+from bot.autotrade import LiveRevolutXExecutor, PaperExecutor, decide_autobuy, total_open_notional
+from bot.marketdata import MarketDataClient, create_market_data_client
+from bot.revolutx import RevolutXClient
+from bot.storage import Storage
+from bot.strategy import (
+    EntrySignal,
+    compute_breakout_signal,
+    compute_dip_signal,
+    compute_momentum_from_5m_candles,
+    fmt_pct,
+)
+from bot.http_server import create_http_app
+
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(name)s - %(message)s",
+)
+logger = logging.getLogger("bot")
+
+
+RESET_CONFIRM_CB = "reset_confirm"
+RESET_CANCEL_CB = "reset_cancel"
+
+SETUP_START_CB = "setup_start"
+SETUP_CANCEL_CB = "setup_cancel"
+
+SETUP_BASE_PREFIX = "setup_base:"
+SETUP_RISK_PREFIX = "setup_risk:"
+SETUP_SCAN_PREFIX = "setup_scan:"
+SETUP_PAIRS_PREFIX = "setup_pairs:"
+SETUP_HARDMIN_PREFIX = "setup_hardmin:"
+SETUP_CONFIRM_CB = "setup_confirm"
+
+SETUP_STEP_NONE = None
+SETUP_STEP_BASE = "base_currency"
+SETUP_STEP_CAPITAL = "starting_capital"
+SETUP_STEP_RISK = "risk_mode"
+SETUP_STEP_SCAN = "scan_interval_seconds"
+SETUP_STEP_PAIRS = "pairs_limit"
+SETUP_STEP_HARDMIN = "hard_close_minute"
+SETUP_STEP_CONFIRM = "confirm"
+
+
+def _authorized(cfg: AppConfig, update: Update) -> bool:
+    chat = update.effective_chat
+    # If allowed chat id is not configured, authorization is handled by onboarding
+    # (first /start becomes owner).
+    if not chat:
+        return False
+    if cfg.telegram_allowed_chat_id is None:
+        return True
+    return chat.id == cfg.telegram_allowed_chat_id
+
+
+async def _get_owner_chat_id(context: ContextTypes.DEFAULT_TYPE) -> int | None:
+    cfg: AppConfig = context.application.bot_data["cfg"]
+    if cfg.telegram_allowed_chat_id is not None:
+        return cfg.telegram_allowed_chat_id
+    store: Storage = context.application.bot_data["store"]
+    st = await asyncio.to_thread(store.get_settings)
+    v = st.get("owner_chat_id")
+    return int(v) if v is not None else None
+
+
+def _money(x: float, cur: str) -> str:
+    return f"{x:.2f} {cur}"
+
+
+def _parse_float(s: str) -> float | None:
+    try:
+        return float(s.replace(",", "."))
+    except Exception:
+        return None
+
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    cfg: AppConfig = context.application.bot_data["cfg"]
+    if not _authorized(cfg, update):
+        return
+
+    store: Storage = context.application.bot_data["store"]
+    # If TELEGRAM_ALLOWED_CHAT_ID is not set, bind first /start chat as owner.
+    if cfg.telegram_allowed_chat_id is None:
+        owner = await _get_owner_chat_id(context)
+        chat = update.effective_chat
+        if owner is None and chat:
+            await asyncio.to_thread(store.update_settings, owner_chat_id=chat.id)
+            owner = chat.id
+            await update.message.reply_text(
+                f"✅ Registrazione completata. Questa chat è ora l’owner (chat_id={owner})."
+            )
+        # If someone else writes later, block.
+        if owner is not None and chat and chat.id != owner:
+            return
+
+    st = await asyncio.to_thread(store.get_settings)
+    # Auto-defaults on /start (requested UX):
+    # - risk normal
+    # - autotrade ON
+    # - 24/7 (always)
+    # - scanner active
+    #
+    # Can be disabled via ENV: AUTO_DEFAULTS_ON_START=0
+    auto_defaults = os.getenv("AUTO_DEFAULTS_ON_START", "1") != "0"
+    # Safety: only default to LIVE if explicitly allowed via ENV.
+    allow_live = os.getenv("ALLOW_LIVE_TRADING", "0") == "1"
+    default_autotrade_mode = (os.getenv("AUTO_DEFAULTS_AUTOTRADE_MODE", "live") or "live").lower().strip()
+    if default_autotrade_mode not in ("paper", "live"):
+        default_autotrade_mode = "live"
+    if default_autotrade_mode == "live" and not allow_live:
+        default_autotrade_mode = "paper"
+    desired_defaults: dict[str, Any] = {
+        "risk_mode": "normal",
+        "autotrade_enabled": 1,
+        "autotrade_mode": default_autotrade_mode,
+        "entry_strategy": (os.getenv("AUTO_DEFAULTS_ENTRY_STRATEGY", "ranked") or "ranked").lower().strip(),
+        "autotrade_cap_mode": (os.getenv("AUTO_DEFAULTS_CAP_MODE", "compound") or "compound").lower().strip(),
+        # Performance tuning defaults (allow ENV to win over stale DB defaults)
+        "pairs_limit": int(_parse_float(os.getenv("PAIRS_LIMIT", str(cfg.pairs_limit)) or str(cfg.pairs_limit)) or cfg.pairs_limit),
+        "scan_interval_seconds": int(_parse_float(os.getenv("SCAN_INTERVAL_SECONDS", str(cfg.scan_interval_seconds)) or str(cfg.scan_interval_seconds)) or cfg.scan_interval_seconds),
+        # Default budget setup: use BOTH wallets (100 USDC + 100 USDT) unless overridden by ENV.
+        # Single-quote fallback remains autotrade_max_quote/autotrade_quote_currency.
+        "autotrade_max_quote": float(_parse_float(os.getenv("AUTO_DEFAULTS_CAP_AMT", "100") or "100") or 100.0),
+        "autotrade_quote_currency": (os.getenv("AUTO_DEFAULTS_CAP_CUR", "USDC") or "USDC").upper().strip(),
+        "autotrade_quote_currencies": (os.getenv("AUTO_DEFAULTS_CAP_CURS", "USDC") or "USDC").upper().strip(),
+        "autotrade_caps_json": (os.getenv("AUTO_DEFAULTS_CAPS_JSON", "") or "").strip() or json.dumps({"USDC": 100.0}),
+        "mode": "always",
+        "paused": 0,
+        "bootstrapped": 1,
+    }
+    needs_defaults = any(st.get(k) != v for k, v in desired_defaults.items())
+    if auto_defaults and needs_defaults:
+        await asyncio.to_thread(
+            store.update_settings,
+            **desired_defaults,
+        )
+        st = await asyncio.to_thread(store.get_settings)
+    risk = RISK_PROFILES.get(st["risk_mode"], RISK_PROFILES["aggressive"])
+
+    now = datetime.now(cfg.tz)
+    run_mode = (st.get("mode") or "session").lower()
+    autotrade_enabled = bool(int(st.get("autotrade_enabled", 0)))
+    autotrade_mode = st.get("autotrade_mode", "paper")
+    cap_amt = st.get("autotrade_max_quote", 100.0)
+    cap_cur = st.get("autotrade_quote_currency", "USDT")
+    multi_quotes = st.get("autotrade_quote_currencies") or ""
+    multicaps = st.get("autotrade_caps_json") or ""
+    cap_effective_by_quote = (context.application.bot_data.get("metrics", {}) or {}).get("cap_effective_by_quote")
+
+    msg = (
+        "*Revolut X AutoTrade Bot*\n\n"
+        f"Stato:\n"
+        f"- ora: `{now.isoformat(timespec='seconds')}`\n"
+        f"- run mode: `{run_mode}` (always=24/7)\n"
+        f"- scanner paused: `{bool(st['paused'])}`\n"
+        f"- risk: `{risk.name}` (mom_1h≥{fmt_pct(risk.mom_1h_threshold)}, mom_15m≥{fmt_pct(risk.mom_15m_threshold)}, trailing={fmt_pct(risk.trailing_stop_pct)})\n"
+        f"- autotrade: `{autotrade_enabled}` mode=`{autotrade_mode}` cap=`{cap_amt} {cap_cur}`\n"
+        f"- multi_quotes: `{multi_quotes or 'n/a'}`\n"
+        f"- multicaps: `{multicaps or 'n/a'}`\n"
+        f"- cap_effective_by_quote (last scan): `{cap_effective_by_quote or 'n/a'}`\n\n"
+        "Comandi principali:\n"
+        "- /status\n"
+        "- /wallet\n"
+        "- /setmode always|session\n"
+        "- /autotrade on|off\n"
+        "- /autotrade mode paper|live\n"
+        "- /autotrade cap <AMOUNT> <CUR>\n"
+    )
+    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+
+
+async def _build_status_text(context: ContextTypes.DEFAULT_TYPE) -> str:
+    cfg: AppConfig = context.application.bot_data["cfg"]
+    store: Storage = context.application.bot_data["store"]
+    st = await asyncio.to_thread(store.get_settings)
+    risk = RISK_PROFILES.get(st["risk_mode"], RISK_PROFILES["aggressive"])
+
+    now = datetime.now(cfg.tz)
+    paused = bool(int(st.get("paused", 0)))
+    run_mode = (st.get("mode") or "session").lower()
+
+    owner = await _get_owner_chat_id(context)
+    positions = await asyncio.to_thread(store.list_positions)
+
+    metrics: dict[str, Any] = context.application.bot_data.setdefault("metrics", {})
+    scans_ok = int(metrics.get("scans_ok", 0))
+    scans_err = int(metrics.get("scans_err", 0))
+    signals_sent = int(metrics.get("signals_sent", 0))
+    last_trade_action = metrics.get("last_trade_action")
+    last_trade_ts = metrics.get("last_trade_ts")
+
+    def _fmt_ts(v: Any) -> str:
+        if not v:
+            return "n/a"
+        try:
+            return datetime.fromtimestamp(float(v), tz=cfg.tz).isoformat(timespec="seconds")
+        except Exception:
+            return "n/a"
+
+    last_pairs_count = metrics.get("last_pairs_count")
+    why = []
+    if paused:
+        why.append("scanner in pausa")
+    if last_pairs_count in (0, None):
+        why.append("pairs non disponibili (endpoint/parsing)")
+    # If we see momentum hits but no tradable hits, explain the real reason.
+    try:
+        mom_hits = int(metrics.get("scan_mom_hits", 0) or 0)
+        trad_hits = int(metrics.get("scan_tradable_hits", 0) or 0)
+        if mom_hits > 0 and trad_hits == 0:
+            why.append("segnali trovati ma nessuna coppia tradabile su Revolut X (quote/pairs mismatch)")
+    except Exception:
+        pass
+    if not why:
+        why.append("nessun segnale (soglie non raggiunte)")
+
+    base_url = st.get("revolutx_base_url") or cfg.revolutx_base_url
+    base_path = st.get("revolutx_base_path") or cfg.revolutx_base_path
+    md_provider = context.application.bot_data.get("md_provider", "binance")
+    md_quote = context.application.bot_data.get("md_quote", "EUR")
+
+    # Plain text on purpose: avoids Telegram parse errors (HTML/Markdown entities).
+    text = (
+        "STATUS BOT\n"
+        f"- ora: {now.isoformat(timespec='seconds')}\n"
+        f"- owner chat_id: {owner}\n"
+        f"- paused: {paused}\n"
+        f"- mode: {run_mode} (always=24/7)\n"
+        f"- risk: {risk.name} (mom_1h≥{fmt_pct(risk.mom_1h_threshold)}, mom_15m≥{fmt_pct(risk.mom_15m_threshold)}, trailing={fmt_pct(risk.trailing_stop_pct)})\n"
+        "\n"
+        "SCANNER\n"
+        f"- last scan started: {_fmt_ts(metrics.get('last_scan_started'))}\n"
+        f"- last scan completed: {_fmt_ts(metrics.get('last_scan_completed'))}\n"
+        f"- last pairs count: {last_pairs_count if last_pairs_count is not None else 'n/a'}\n"
+        f"- scans ok/err: {scans_ok}/{scans_err}\n"
+        f"- last scan note: {metrics.get('last_scan_note') or 'n/a'}\n"
+        f"- universe: {metrics.get('scan_universe') or 'n/a'} scanned={metrics.get('scan_pairs_scanned') or 'n/a'}\n"
+        f"- mom hits: {metrics.get('scan_mom_hits') or 0} / tradable hits: {metrics.get('scan_tradable_hits') or 0}\n"
+        f"- best mom15 (seen): {fmt_pct(float(metrics.get('scan_best_mom15'))) if metrics.get('scan_best_mom15') is not None else 'n/a'} @ {metrics.get('scan_best_symbol') or 'n/a'}\n"
+        f"- SCAN_UNIVERSE env: {os.getenv('SCAN_UNIVERSE','<unset>')}\n"
+        f"- revx public symbols (cached): {len((context.application.bot_data.get('revx_public_symbols_cache', {}) or {}).get('data') or [])}\n"
+        "\n"
+        "NOTIFICHE\n"
+        f"- signals sent (runtime): {signals_sent}\n"
+        f"- last signal: {_fmt_ts(metrics.get('last_signal_ts'))}\n"
+        f"- perché potresti non riceverne: {'; '.join(why)}\n"
+        f"- last trade action: {last_trade_action or 'n/a'} @ {_fmt_ts(last_trade_ts)}\n"
+        "\n"
+        "PORTFOLIO (manuale)\n"
+        f"- posizioni aperte: {len(positions)}\n"
+        "\n"
+        "REVOLUT X\n"
+        f"- base_url: {base_url}\n"
+        f"- base_path: {base_path}\n"
+        f"- api_key presente: {bool(cfg.revolutx_api_key)}\n"
+        "\n"
+        "MARKET DATA\n"
+        f"- provider: {md_provider}\n"
+        f"- quote: {md_quote}\n"
+        "\n"
+        "AUTOTRADE\n"
+        f"- enabled: {bool(int(st.get('autotrade_enabled', 0)))}\n"
+        f"- mode: {st.get('autotrade_mode', 'paper')}\n"
+        f"- cap: {st.get('autotrade_max_quote', 100.0)} {st.get('autotrade_quote_currency', 'USDT')}\n"
+        f"- cap_mode: {st.get('autotrade_cap_mode', 'fixed')}\n"
+        f"- cap_effective (last scan): {metrics.get('cap_effective') if metrics.get('cap_effective') is not None else 'n/a'}\n"
+        f"- multi_quotes: {st.get('autotrade_quote_currencies') or 'n/a'}\n"
+        f"- multicaps: {st.get('autotrade_caps_json') or 'n/a'}\n"
+        f"- cap_effective_by_quote (last scan): {metrics.get('cap_effective_by_quote') if metrics.get('cap_effective_by_quote') is not None else 'n/a'}\n"
+    )
+    last_error = metrics.get("last_error")
+    if last_error:
+        text += "\nULTIMO ERRORE\n" + str(last_error)[:800] + "\n"
+    return text
+
+
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    cfg: AppConfig = context.application.bot_data["cfg"]
+    if not _authorized(cfg, update):
+        return
+    owner = await _get_owner_chat_id(context)
+    chat = update.effective_chat
+    if owner is not None and chat and chat.id != owner:
+        return
+    await update.message.reply_text(await _build_status_text(context))
+
+async def cmd_wallet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    cfg: AppConfig = context.application.bot_data["cfg"]
+    if not _authorized(cfg, update):
+        return
+    owner = await _get_owner_chat_id(context)
+    chat = update.effective_chat
+    if owner is not None and chat and chat.id != owner:
+        return
+    rx: RevolutXClient = context.application.bot_data["rx"]
+    data = await asyncio.to_thread(rx.get_balances)
+    if not isinstance(data, list):
+        await update.message.reply_text("Wallet: non disponibile (balances non è una lista).")
+        return
+    # Show main currencies first
+    wanted = ["USDT", "USD", "EUR", "BTC", "ETH", "SOL"]
+    by_cur = {str(r.get("currency", "")).upper(): r for r in data if isinstance(r, dict)}
+    lines = ["WALLET (Revolut X)"]
+    for cur in wanted:
+        r = by_cur.get(cur)
+        if not r:
+            continue
+        lines.append(f"- {cur}: available={r.get('available')} reserved={r.get('reserved')}")
+    # Show a few more non-zero
+    extra = []
+    for cur, r in by_cur.items():
+        if cur in wanted:
+            continue
+        try:
+            av = float(r.get("available") or 0)
+        except Exception:
+            continue
+        if av <= 0:
+            continue
+        extra.append((av, cur))
+    extra.sort(reverse=True)
+    for av, cur in extra[:10]:
+        lines.append(f"- {cur}: available={by_cur[cur].get('available')} reserved={by_cur[cur].get('reserved')}")
+    await update.message.reply_text("\n".join(lines))
+
+
+async def cmd_egressip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /egressip
+    Shows the public outbound IP of the host running the bot (useful for IP whitelisting).
+    """
+    cfg: AppConfig = context.application.bot_data["cfg"]
+    if not _authorized(cfg, update):
+        return
+    owner = await _get_owner_chat_id(context)
+    chat = update.effective_chat
+    if owner is not None and chat and chat.id != owner:
+        return
+
+    def _fetch_ip() -> str:
+        try:
+            with urllib.request.urlopen("https://api.ipify.org", timeout=10) as r:
+                return r.read().decode("utf-8").strip()
+        except Exception as e:
+            return f"error: {repr(e)}"
+
+    ip = await asyncio.to_thread(_fetch_ip)
+    await update.message.reply_text(f"Egress IP (public): {ip}\n\nNota: su Railway l'IP può cambiare.")
+
+
+async def egress_ip_report_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Periodic egress IP report to help with Revolut X IP whitelist.
+    Default every 12 hours (configurable via ENV).
+    """
+    cfg: AppConfig = context.application.bot_data["cfg"]
+    owner = await _get_owner_chat_id(context)
+    if owner is None:
+        return
+
+    def _fetch_ip() -> str:
+        try:
+            with urllib.request.urlopen("https://api.ipify.org", timeout=10) as r:
+                return r.read().decode("utf-8").strip()
+        except Exception as e:
+            return f"error: {repr(e)}"
+
+    ip = await asyncio.to_thread(_fetch_ip)
+    bot_data = context.application.bot_data
+    prev = bot_data.get("last_egress_ip")
+    bot_data["last_egress_ip"] = ip
+    changed = (prev is not None and prev != ip)
+
+    msg = "EGRESS IP REPORT\n" f"- ora: {datetime.now(cfg.tz).isoformat(timespec='seconds')}\n" f"- ip: {ip}\n"
+    if prev is None:
+        msg += "- changed: n/a (first report)\n"
+    else:
+        msg += f"- changed: {changed}\n"
+        if changed:
+            msg += f"- prev: {prev}\n"
+    msg += "\nNota: se usi whitelist IP su Revolut X e l'IP cambia, aggiorna la whitelist."
+    await context.application.bot.send_message(chat_id=owner, text=msg)
+
+
+async def cmd_revxprobe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Probes common Revolut X REST API paths (read-only) to discover correct endpoints.
+    """
+    cfg: AppConfig = context.application.bot_data["cfg"]
+    if not _authorized(cfg, update):
+        return
+    owner = await _get_owner_chat_id(context)
+    chat = update.effective_chat
+    if owner is not None and chat and chat.id != owner:
+        return
+
+    rx: RevolutXClient = context.application.bot_data["rx"]
+    candidates = [
+        "/api/1.0/balances",
+        "/api/1.0/configuration/currencies",
+        "/api/1.0/configuration/currency-pairs",
+        "/api/1.0/pairs",
+        "/api/1.0/symbols",
+        "/api/1.0/instruments",
+        "/api/1.0/markets",
+        "/api/1.0/ticker",
+        "/api/1.0/tickers",
+        "/api/1.0/candles",
+        "/api/1.0/klines",
+        "/api/1.0/orders/active",
+        "/api/1.0/orders/historical",
+        "/api/1.0/orders",
+        "/api/1.0/trades",
+        "/api/1.0/trades/private/BTC-USD",
+        "/api/1.0/trades/private/BTC-USDT",
+    ]
+    results = await asyncio.to_thread(rx.probe, candidates)
+    lines = ["REVX PROBE (GET)"]
+    lines.append(f"- auth_ready: {await asyncio.to_thread(rx.auth_ready)}")
+    for r in results:
+        lines.append(f"- {r['path']}: {r['status']} {'' if not r['sample'] else str(r['sample'])[:60]}")
+    lines.append("\nSe vedi 200 su balances/pairs/candles, mi hai trovato gli endpoint corretti.")
+    await update.message.reply_text("\n".join(lines))
+
+
+async def cmd_revxpub(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Prints the public key PEM derived from the private key loaded on the server.
+    Paste this into Revolut X API key creation (public key field).
+    """
+    cfg: AppConfig = context.application.bot_data["cfg"]
+    if not _authorized(cfg, update):
+        return
+    owner = await _get_owner_chat_id(context)
+    chat = update.effective_chat
+    if owner is not None and chat and chat.id != owner:
+        return
+    rx: RevolutXClient = context.application.bot_data["rx"]
+    pem = await asyncio.to_thread(rx.derived_public_key_pem)
+    if not pem:
+        await update.message.reply_text("Nessuna private key caricata/leggibile sul server.")
+        return
+    await update.message.reply_text("PUBLIC KEY (derived from server private key):\n" + pem)
+async def cmd_setmode(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    cfg: AppConfig = context.application.bot_data["cfg"]
+    if not _authorized(cfg, update):
+        return
+    owner = await _get_owner_chat_id(context)
+    chat = update.effective_chat
+    if owner is not None and chat and chat.id != owner:
+        return
+    if not context.args:
+        await update.message.reply_text("Uso: `/setmode session|always`", parse_mode=ParseMode.MARKDOWN)
+        return
+    mode = context.args[0].lower().strip()
+    if mode not in ("session", "always"):
+        await update.message.reply_text("Valore non valido. Usa: session|always")
+        return
+    store: Storage = context.application.bot_data["store"]
+    await asyncio.to_thread(store.update_settings, mode=mode)
+    await update.message.reply_text(f"OK. Mode impostato: {mode}.")
+
+
+async def cmd_autotrade(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /autotrade on|off
+    /autotrade mode paper|live
+    /autotrade cap 100 USDT
+    /autotrade capmode fixed|balance|compound
+    /autotrade quotes USDC,USDT
+    /autotrade multicaps 100 USDC 100 USDT
+    """
+    cfg: AppConfig = context.application.bot_data["cfg"]
+    if not _authorized(cfg, update):
+        return
+    owner = await _get_owner_chat_id(context)
+    chat = update.effective_chat
+    if owner is not None and chat and chat.id != owner:
+        return
+
+    store: Storage = context.application.bot_data["store"]
+    if not context.args:
+        st = await asyncio.to_thread(store.get_settings)
+        await update.message.reply_text(
+            "Uso:\n"
+            "- /autotrade on|off\n"
+            "- /autotrade mode paper|live\n"
+            "- /autotrade cap 100 USDT\n"
+            "- /autotrade capmode fixed|balance|compound\n\n"
+            "- /autotrade quotes USDC,USDT\n"
+            "- /autotrade multicaps 100 USDC 100 USDT\n\n"
+            f"Stato: enabled={bool(int(st.get('autotrade_enabled',0)))}, mode={st.get('autotrade_mode','paper')}, "
+            f"cap={st.get('autotrade_max_quote',100)} {st.get('autotrade_quote_currency','USDT')} "
+            f"capmode={st.get('autotrade_cap_mode','fixed')} "
+            f"multi_quotes={st.get('autotrade_quote_currencies') or 'n/a'} "
+            f"multicaps={st.get('autotrade_caps_json') or 'n/a'}"
+        )
+        return
+
+    sub = context.args[0].lower()
+    if sub in ("on", "off"):
+        enabled = 1 if sub == "on" else 0
+        await asyncio.to_thread(store.update_settings, autotrade_enabled=enabled)
+        if enabled == 1:
+            # Force 24/7 as requested
+            await asyncio.to_thread(store.update_settings, mode="always")
+        st = await asyncio.to_thread(store.get_settings)
+        await update.message.reply_text(
+            f"OK. autotrade_enabled={bool(enabled)} (mode={st.get('mode','session')})."
+        )
+        return
+
+    if sub == "mode":
+        if len(context.args) < 2:
+            await update.message.reply_text("Uso: `/autotrade mode paper|live`", parse_mode=ParseMode.MARKDOWN)
+            return
+        m = context.args[1].lower().strip()
+        if m not in ("paper", "live"):
+            await update.message.reply_text("Valore non valido. Usa: paper|live")
+            return
+        if m == "live":
+            # Safety: require explicit env confirmation, because Revolut X trading endpoints/signature must be correct.
+            if os.getenv("ALLOW_LIVE_TRADING", "0") != "1":
+                await update.message.reply_text(
+                    "LIVE trading è bloccato per sicurezza.\n"
+                    "Per abilitarlo devi impostare su Railway: `ALLOW_LIVE_TRADING=1` (e avere auth/endpoints Revolut X corretti)."
+                )
+                return
+        await asyncio.to_thread(store.update_settings, autotrade_mode=m)
+        await update.message.reply_text(f"OK. autotrade_mode={m}.")
+        return
+
+    if sub == "cap":
+        if len(context.args) < 3:
+            await update.message.reply_text("Uso: `/autotrade cap 100 USDT`", parse_mode=ParseMode.MARKDOWN)
+            return
+        amt = _parse_float(context.args[1])
+        cur = context.args[2].upper()
+        if amt is None or amt <= 0:
+            await update.message.reply_text("Importo non valido.")
+            return
+        await asyncio.to_thread(store.update_settings, autotrade_max_quote=float(amt), autotrade_quote_currency=cur)
+        await update.message.reply_text(f"OK. Cap autotrade: {amt:.2f} {cur}.")
+        return
+
+    if sub == "capmode":
+        if len(context.args) < 2:
+            await update.message.reply_text("Uso: `/autotrade capmode fixed|balance|compound`", parse_mode=ParseMode.MARKDOWN)
+            return
+        m = context.args[1].lower().strip()
+        if m not in ("fixed", "balance", "compound"):
+            await update.message.reply_text("Valore non valido. Usa: fixed|balance|compound")
+            return
+        await asyncio.to_thread(store.update_settings, autotrade_cap_mode=m)
+        await update.message.reply_text(f"OK. autotrade_cap_mode={m}.")
+        return
+
+    if sub == "quotes":
+        if len(context.args) < 2:
+            await update.message.reply_text("Uso: `/autotrade quotes USDC,USDT`", parse_mode=ParseMode.MARKDOWN)
+            return
+        raw = context.args[1]
+        quotes = []
+        for q in raw.split(","):
+            qq = q.strip().upper()
+            if qq:
+                quotes.append(qq)
+        if not quotes:
+            await update.message.reply_text("Valore non valido. Esempio: USDC,USDT")
+            return
+        await asyncio.to_thread(store.update_settings, autotrade_quote_currencies=",".join(quotes))
+        await update.message.reply_text(f"OK. autotrade_quote_currencies={','.join(quotes)}")
+        return
+
+    if sub == "multicaps":
+        # Usage: /autotrade multicaps 100 USDC 100 USDT ...
+        if len(context.args) < 3 or (len(context.args) - 1) % 2 != 0:
+            await update.message.reply_text("Uso: `/autotrade multicaps 100 USDC 100 USDT`", parse_mode=ParseMode.MARKDOWN)
+            return
+        caps: dict[str, float] = {}
+        quotes: list[str] = []
+        i = 1
+        while i + 1 < len(context.args):
+            amt = _parse_float(context.args[i])
+            cur = str(context.args[i + 1]).upper().strip()
+            if amt is None or amt <= 0 or not cur:
+                await update.message.reply_text("Valori non validi. Esempio: `/autotrade multicaps 100 USDC 100 USDT`", parse_mode=ParseMode.MARKDOWN)
+                return
+            caps[cur] = float(amt)
+            quotes.append(cur)
+            i += 2
+        await asyncio.to_thread(
+            store.update_settings,
+            autotrade_caps_json=json.dumps(caps),
+            autotrade_quote_currencies=",".join(quotes),
+        )
+        await update.message.reply_text(f"OK. multicaps={caps} quotes={','.join(quotes)}")
+        return
+
+    await update.message.reply_text("Comando non riconosciuto. Usa: on|off|mode|cap|capmode|quotes|multicaps")
+
+
+async def cmd_testbuy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    /testbuy
+      -> tries a tiny market BUY on BTC-USDC (1 USDC) and BTC-USDT (1 USDT)
+
+    /testbuy SYMBOL AMOUNT
+      -> e.g. /testbuy BTC-USDC 1
+
+    /testbuy BASE AMOUNT QUOTE
+      -> e.g. /testbuy BTC 1 USDC
+    """
+    cfg: AppConfig = context.application.bot_data["cfg"]
+    if not _authorized(cfg, update):
+        return
+    owner = await _get_owner_chat_id(context)
+    chat = update.effective_chat
+    if owner is not None and chat and chat.id != owner:
+        return
+
+    # Safety: require explicit env confirmation for any live order.
+    if os.getenv("ALLOW_LIVE_TRADING", "0") != "1":
+        await update.message.reply_text(
+            "Test buy bloccato.\n"
+            "Per abilitare ordini reali imposta su Railway: `ALLOW_LIVE_TRADING=1` e riavvia."
+        )
+        return
+
+    store: Storage = context.application.bot_data["store"]
+    st = await asyncio.to_thread(store.get_settings)
+    if str(st.get("autotrade_mode", "paper")).lower() != "live":
+        await update.message.reply_text("Imposta prima: `/autotrade mode live`")
+        return
+
+    live_exec: LiveRevolutXExecutor = context.application.bot_data["live_exec"]
+
+    def _mk_symbol(base: str, quote: str) -> str:
+        return f"{base.upper()}-{quote.upper()}"
+
+    # Parse args
+    symbols_to_try: list[tuple[str, float, str]] = []
+    if not context.args:
+        base = os.getenv("TESTBUY_BASE", "BTC").upper().strip() or "BTC"
+        for q in ["USDC", "USDT"]:
+            symbols_to_try.append((_mk_symbol(base, q), 1.0, q))
+    elif len(context.args) == 2:
+        sym = context.args[0].upper().strip()
+        amt = _parse_float(context.args[1])
+        if not sym or amt is None or amt <= 0:
+            await update.message.reply_text("Uso: `/testbuy BTC-USDC 1`", parse_mode=ParseMode.MARKDOWN)
+            return
+        q = sym.split("-")[-1].upper() if "-" in sym else "QUOTE"
+        symbols_to_try.append((sym, float(amt), q))
+    elif len(context.args) >= 3:
+        base = context.args[0].upper().strip()
+        amt = _parse_float(context.args[1])
+        quote = context.args[2].upper().strip()
+        if not base or amt is None or amt <= 0 or not quote:
+            await update.message.reply_text("Uso: `/testbuy BTC 1 USDC`", parse_mode=ParseMode.MARKDOWN)
+            return
+        symbols_to_try.append((_mk_symbol(base, quote), float(amt), quote))
+
+    # Execute
+    lines = ["TEST BUY (live)"]
+    for sym, amt, q in symbols_to_try:
+        res = await asyncio.to_thread(live_exec.buy_quote, sym, amt)
+        if res.ok:
+            lines.append(f"- ✅ BUY ok: {sym} spent≈{amt:.2f} {q} price={res.fill_price if res.fill_price is not None else 'n/a'} order_id={res.order_id}")
+        else:
+            lines.append(f"- ❌ BUY failed: {sym} spent≈{amt:.2f} {q} error={res.error}")
+    await update.message.reply_text("\n".join(lines))
+
+async def cmd_bootstrap(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Force the "startup defaults" without relying on bootstrapped flag.
+    Useful when the DB was reset or migrated and you want to restart quickly.
+    """
+    cfg: AppConfig = context.application.bot_data["cfg"]
+    if not _authorized(cfg, update):
+        return
+    owner = await _get_owner_chat_id(context)
+    chat = update.effective_chat
+    if owner is not None and chat and chat.id != owner:
+        return
+    store: Storage = context.application.bot_data["store"]
+    await asyncio.to_thread(
+        store.update_settings,
+        risk_mode="normal",
+        autotrade_enabled=1,
+        mode="always",
+        paused=0,
+        bootstrapped=1,
+    )
+    await update.message.reply_text("OK. Bootstrap applicato: risk=normal, mode=always, autotrade=ON, scanner=ON.")
+
+
+async def cmd_config(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    cfg: AppConfig = context.application.bot_data["cfg"]
+    if not _authorized(cfg, update):
+        return
+    owner = await _get_owner_chat_id(context)
+    chat = update.effective_chat
+    if owner is not None and chat and chat.id != owner:
+        return
+    store: Storage = context.application.bot_data["store"]
+    st = await asyncio.to_thread(store.get_settings)
+    risk = RISK_PROFILES.get(st["risk_mode"], RISK_PROFILES["aggressive"])
+    msg = (
+        "*Config*\n"
+        f"- paused: `{bool(st['paused'])}`\n"
+        f"- risk: `{risk.name}`\n"
+        f"- base_currency: `{st['base_currency']}`\n"
+        f"- starting_capital: `{st['starting_capital']}`\n"
+        f"- scan_interval_seconds: `{st.get('scan_interval_seconds', cfg.scan_interval_seconds)}`\n"
+        f"- pairs_limit: `{st.get('pairs_limit', cfg.pairs_limit)}`\n"
+        f"- signal_cooldown_seconds: `{cfg.signal_cooldown_seconds}`\n"
+        f"- window: `09:00–20:00 {cfg.tz_name}`\n"
+        f"- hard_close: `19:{st.get('hard_close_minute', cfg.hard_close_time.minute):02d}`\n"
+        f"- revolutx_base_url: `{st.get('revolutx_base_url') or cfg.revolutx_base_url}`\n"
+        f"- revolutx_base_path: `{st.get('revolutx_base_path') or cfg.revolutx_base_path}`\n"
+        "\n"
+        "_Nota: se Revolut X cambia path, aggiorna REVOLUTX_BASE_URL/REVOLUTX_BASE_PATH e i path in bot/revolutx.py._\n"
+    )
+    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+
+
+async def cmd_pause(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    cfg: AppConfig = context.application.bot_data["cfg"]
+    if not _authorized(cfg, update):
+        return
+    owner = await _get_owner_chat_id(context)
+    chat = update.effective_chat
+    if owner is not None and chat and chat.id != owner:
+        return
+    store: Storage = context.application.bot_data["store"]
+    await asyncio.to_thread(store.update_settings, paused=1)
+    await update.message.reply_text("Scansione segnali: *PAUSA*.", parse_mode=ParseMode.MARKDOWN)
+
+
+async def cmd_resume(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    cfg: AppConfig = context.application.bot_data["cfg"]
+    if not _authorized(cfg, update):
+        return
+    owner = await _get_owner_chat_id(context)
+    chat = update.effective_chat
+    if owner is not None and chat and chat.id != owner:
+        return
+    store: Storage = context.application.bot_data["store"]
+    await asyncio.to_thread(store.update_settings, paused=0)
+    await update.message.reply_text("Scansione segnali: *ATTIVA*.", parse_mode=ParseMode.MARKDOWN)
+
+
+async def cmd_setcapital(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    cfg: AppConfig = context.application.bot_data["cfg"]
+    if not _authorized(cfg, update):
+        return
+    owner = await _get_owner_chat_id(context)
+    chat = update.effective_chat
+    if owner is not None and chat and chat.id != owner:
+        return
+    if not context.args or len(context.args) < 2:
+        await update.message.reply_text("Uso: `/setcapital 100 EUR`", parse_mode=ParseMode.MARKDOWN)
+        return
+    amount = _parse_float(context.args[0])
+    cur = context.args[1].upper()
+    if amount is None or amount < 0:
+        await update.message.reply_text("Importo non valido.")
+        return
+    store: Storage = context.application.bot_data["store"]
+    await asyncio.to_thread(store.update_settings, starting_capital=amount, base_currency=cur)
+    await update.message.reply_text(f"OK. Capitale iniziale impostato a {_money(amount, cur)}.")
+
+
+async def cmd_setrisk(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    cfg: AppConfig = context.application.bot_data["cfg"]
+    if not _authorized(cfg, update):
+        return
+    owner = await _get_owner_chat_id(context)
+    chat = update.effective_chat
+    if owner is not None and chat and chat.id != owner:
+        return
+    if not context.args:
+        await update.message.reply_text("Uso: `/setrisk aggressive|normal|conservative`", parse_mode=ParseMode.MARKDOWN)
+        return
+    mode = context.args[0].lower()
+    if mode not in RISK_PROFILES:
+        await update.message.reply_text("Valore non valido. Usa: aggressive|normal|conservative")
+        return
+    store: Storage = context.application.bot_data["store"]
+    await asyncio.to_thread(store.update_settings, risk_mode=mode)
+    r = RISK_PROFILES[mode]
+    await update.message.reply_text(
+        f"OK. Risk mode: *{r.name}* (mom_1h≥{fmt_pct(r.mom_1h_threshold)}, mom_15m≥{fmt_pct(r.mom_15m_threshold)}, trailing={fmt_pct(r.trailing_stop_pct)}).",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+async def cmd_setentry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    cfg: AppConfig = context.application.bot_data["cfg"]
+    if not _authorized(cfg, update):
+        return
+    owner = await _get_owner_chat_id(context)
+    chat = update.effective_chat
+    if owner is not None and chat and chat.id != owner:
+        return
+    if not context.args:
+        await update.message.reply_text("Uso: `/setentry momentum|ranked|breakout|dip`", parse_mode=ParseMode.MARKDOWN)
+        return
+    mode = context.args[0].lower().strip()
+    if mode not in ("momentum", "ranked", "breakout", "dip"):
+        await update.message.reply_text("Valore non valido. Usa: momentum|ranked|breakout|dip")
+        return
+    store: Storage = context.application.bot_data["store"]
+    await asyncio.to_thread(store.update_settings, entry_strategy=mode)
+    await update.message.reply_text(f"OK. entry_strategy={mode}.")
+
+
+def _parse_trade_cmd(args: list[str]) -> tuple[str, float, float] | None:
+    """
+    Expected:
+      /buy SYMBOL AMOUNT at PRICE
+    Example:
+      /buy BTC-EUR 20 at 43000
+    """
+    if len(args) < 4:
+        return None
+    symbol = args[0].upper()
+    amount = _parse_float(args[1])
+    if amount is None:
+        return None
+    if args[2].lower() != "at":
+        return None
+    price = _parse_float(args[3])
+    if price is None or price <= 0:
+        return None
+    return symbol, float(amount), float(price)
+
+
+async def cmd_buy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    cfg: AppConfig = context.application.bot_data["cfg"]
+    if not _authorized(cfg, update):
+        return
+    owner = await _get_owner_chat_id(context)
+    chat = update.effective_chat
+    if owner is not None and chat and chat.id != owner:
+        return
+    parsed = _parse_trade_cmd(context.args)
+    if not parsed:
+        await update.message.reply_text("Uso: `/buy BTC-EUR 20 at 43000`", parse_mode=ParseMode.MARKDOWN)
+        return
+    symbol, amount, price = parsed
+    store: Storage = context.application.bot_data["store"]
+    st = await asyncio.to_thread(store.get_settings)
+    await asyncio.to_thread(store.add_buy, symbol=symbol, amount_base=amount, price=price)
+    qty = amount / price
+    await update.message.reply_text(
+        f"Registrato BUY: {symbol} • {_money(amount, st['base_currency'])} @ {price:.8g} (qty≈{qty:.8g})"
+    )
+
+
+async def cmd_sell(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    cfg: AppConfig = context.application.bot_data["cfg"]
+    if not _authorized(cfg, update):
+        return
+    owner = await _get_owner_chat_id(context)
+    chat = update.effective_chat
+    if owner is not None and chat and chat.id != owner:
+        return
+    parsed = _parse_trade_cmd(context.args)
+    if not parsed:
+        await update.message.reply_text("Uso: `/sell BTC-EUR 20 at 43000`", parse_mode=ParseMode.MARKDOWN)
+        return
+    symbol, amount, price = parsed
+    store: Storage = context.application.bot_data["store"]
+    st = await asyncio.to_thread(store.get_settings)
+    realized = await asyncio.to_thread(store.add_sell, symbol=symbol, amount_base=amount, price=price)
+    qty = amount / price
+    await update.message.reply_text(
+        f"Registrato SELL: {symbol} • {_money(amount, st['base_currency'])} @ {price:.8g} (qty≈{qty:.8g})\n"
+        f"PnL realizzato (stima): {_money(realized, st['base_currency'])}"
+    )
+
+
+async def cmd_portfolio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    cfg: AppConfig = context.application.bot_data["cfg"]
+    if not _authorized(cfg, update):
+        return
+    owner = await _get_owner_chat_id(context)
+    chat = update.effective_chat
+    if owner is not None and chat and chat.id != owner:
+        return
+
+    store: Storage = context.application.bot_data["store"]
+    st = await asyncio.to_thread(store.get_settings)
+    positions = await asyncio.to_thread(store.list_positions)
+    if not positions:
+        await update.message.reply_text("Nessuna posizione aperta.")
+        return
+
+    client: RevolutXClient = context.application.bot_data["rx"]
+    total_unreal = 0.0
+    lines = ["*Portfolio (posizioni aperte)*"]
+    for p in positions:
+        last_price = await asyncio.to_thread(client.get_last_price, p.symbol)
+        if last_price is None:
+            lines.append(f"- {p.symbol}: qty={p.qty:.8g}, entry={p.avg_entry:.8g}, peak={p.peak_price:.8g} (last: n/a)")
+            continue
+        unreal = (last_price - p.avg_entry) * p.qty
+        total_unreal += unreal
+        lines.append(
+            f"- {p.symbol}: qty={p.qty:.8g}, entry={p.avg_entry:.8g}, peak={p.peak_price:.8g}, last={last_price:.8g}, PnL≈{_money(unreal, st['base_currency'])}"
+        )
+
+    lines.append(f"\nTotale PnL non realizzato (stima): {_money(total_unreal, st['base_currency'])}")
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+
+
+async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    cfg: AppConfig = context.application.bot_data["cfg"]
+    if not _authorized(cfg, update):
+        return
+    owner = await _get_owner_chat_id(context)
+    chat = update.effective_chat
+    if owner is not None and chat and chat.id != owner:
+        return
+    kb = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("CONFERMA RESET", callback_data=RESET_CONFIRM_CB),
+                InlineKeyboardButton("ANNULLA", callback_data=RESET_CANCEL_CB),
+            ]
+        ]
+    )
+    await update.message.reply_text(
+        "Sei sicuro di voler fare RESET? Cancellerò trades/posizioni e ripristinerò le impostazioni di default.",
+        reply_markup=kb,
+    )
+
+
+async def on_reset_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    cfg: AppConfig = context.application.bot_data["cfg"]
+    if not _authorized(cfg, update):
+        return
+    owner = await _get_owner_chat_id(context)
+    chat = update.effective_chat
+    if owner is not None and chat and chat.id != owner:
+        return
+    q = update.callback_query
+    if not q:
+        return
+    await q.answer()
+    if q.data == RESET_CANCEL_CB:
+        await q.edit_message_text("Reset annullato.")
+        return
+    if q.data == RESET_CONFIRM_CB:
+        store: Storage = context.application.bot_data["store"]
+        await asyncio.to_thread(store.reset_all)
+        # Reset signal throttles in memory
+        context.application.bot_data["last_signal_by_symbol"] = {}
+        context.application.bot_data["last_mom15_sign"] = {}
+        await q.edit_message_text("Reset completato.")
+
+def _setup_keyboard_base() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("EUR", callback_data=f"{SETUP_BASE_PREFIX}EUR"),
+                InlineKeyboardButton("USD", callback_data=f"{SETUP_BASE_PREFIX}USD"),
+                InlineKeyboardButton("GBP", callback_data=f"{SETUP_BASE_PREFIX}GBP"),
+            ],
+            [InlineKeyboardButton("Annulla", callback_data=SETUP_CANCEL_CB)],
+        ]
+    )
+
+
+def _setup_keyboard_risk() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("Aggressive", callback_data=f"{SETUP_RISK_PREFIX}aggressive"),
+                InlineKeyboardButton("Normal", callback_data=f"{SETUP_RISK_PREFIX}normal"),
+                InlineKeyboardButton("Conservative", callback_data=f"{SETUP_RISK_PREFIX}conservative"),
+            ],
+            [InlineKeyboardButton("Annulla", callback_data=SETUP_CANCEL_CB)],
+        ]
+    )
+
+
+def _setup_keyboard_scan() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("30s", callback_data=f"{SETUP_SCAN_PREFIX}30"),
+                InlineKeyboardButton("60s", callback_data=f"{SETUP_SCAN_PREFIX}60"),
+                InlineKeyboardButton("120s", callback_data=f"{SETUP_SCAN_PREFIX}120"),
+            ],
+            [InlineKeyboardButton("Annulla", callback_data=SETUP_CANCEL_CB)],
+        ]
+    )
+
+
+def _setup_keyboard_pairs() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("20", callback_data=f"{SETUP_PAIRS_PREFIX}20"),
+                InlineKeyboardButton("50", callback_data=f"{SETUP_PAIRS_PREFIX}50"),
+                InlineKeyboardButton("100", callback_data=f"{SETUP_PAIRS_PREFIX}100"),
+            ],
+            [InlineKeyboardButton("Annulla", callback_data=SETUP_CANCEL_CB)],
+        ]
+    )
+
+
+def _setup_keyboard_hardmin() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("19:45", callback_data=f"{SETUP_HARDMIN_PREFIX}45"),
+                InlineKeyboardButton("19:50", callback_data=f"{SETUP_HARDMIN_PREFIX}50"),
+                InlineKeyboardButton("19:55", callback_data=f"{SETUP_HARDMIN_PREFIX}55"),
+            ],
+            [InlineKeyboardButton("Annulla", callback_data=SETUP_CANCEL_CB)],
+        ]
+    )
+
+
+async def cmd_setup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    cfg: AppConfig = context.application.bot_data["cfg"]
+    if not _authorized(cfg, update):
+        return
+    owner = await _get_owner_chat_id(context)
+    chat = update.effective_chat
+    if owner is not None and chat and chat.id != owner:
+        return
+    store: Storage = context.application.bot_data["store"]
+    await asyncio.to_thread(store.set_onboarding, SETUP_STEP_BASE, {})
+    await update.message.reply_text(
+        "*Setup guidato*\nStep 1/6: scegli la valuta base.",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=_setup_keyboard_base(),
+    )
+
+
+async def _setup_advance_prompt(context: ContextTypes.DEFAULT_TYPE, step: str) -> None:
+    cfg: AppConfig = context.application.bot_data["cfg"]
+    if step == SETUP_STEP_CAPITAL:
+        await context.application.bot.send_message(
+            chat_id=cfg.telegram_allowed_chat_id,
+            text="Step 2/6: scrivi il *capitale iniziale* (solo numero). Esempio: `1000`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    elif step == SETUP_STEP_RISK:
+        await context.application.bot.send_message(
+            chat_id=cfg.telegram_allowed_chat_id,
+            text="Step 3/6: scegli il profilo rischio (soglie momentum + trailing).",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=_setup_keyboard_risk(),
+        )
+    elif step == SETUP_STEP_SCAN:
+        await context.application.bot.send_message(
+            chat_id=cfg.telegram_allowed_chat_id,
+            text="Step 4/6: ogni quanto scansionare i simboli?",
+            reply_markup=_setup_keyboard_scan(),
+        )
+    elif step == SETUP_STEP_PAIRS:
+        await context.application.bot.send_message(
+            chat_id=cfg.telegram_allowed_chat_id,
+            text="Step 5/6: quanti simboli scansionare (per performance)?",
+            reply_markup=_setup_keyboard_pairs(),
+        )
+    elif step == SETUP_STEP_HARDMIN:
+        await context.application.bot.send_message(
+            chat_id=cfg.telegram_allowed_chat_id,
+            text="Step 6/6: a che ora vuoi l’alert *CHIUDI TUTTO*?",
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=_setup_keyboard_hardmin(),
+        )
+    elif step == SETUP_STEP_CONFIRM:
+        store: Storage = context.application.bot_data["store"]
+        ob = await asyncio.to_thread(store.get_onboarding)
+        data = ob.get("data", {})
+        kb = InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("Conferma e salva", callback_data=SETUP_CONFIRM_CB)],
+                [InlineKeyboardButton("Annulla", callback_data=SETUP_CANCEL_CB)],
+            ]
+        )
+        await context.application.bot.send_message(
+            chat_id=cfg.telegram_allowed_chat_id,
+            text=(
+                "*Riepilogo setup*\n"
+                f"- base_currency: `{data.get('base_currency')}`\n"
+                f"- starting_capital: `{data.get('starting_capital')}`\n"
+                f"- risk_mode: `{data.get('risk_mode')}`\n"
+                f"- scan_interval_seconds: `{data.get('scan_interval_seconds')}`\n"
+                f"- pairs_limit: `{data.get('pairs_limit')}`\n"
+                f"- hard_close_minute: `{data.get('hard_close_minute')}`\n"
+            ),
+            parse_mode=ParseMode.MARKDOWN,
+            reply_markup=kb,
+        )
+
+
+async def on_setup_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    cfg: AppConfig = context.application.bot_data["cfg"]
+    if not _authorized(cfg, update):
+        return
+    owner = await _get_owner_chat_id(context)
+    chat = update.effective_chat
+    if owner is not None and chat and chat.id != owner:
+        return
+    q = update.callback_query
+    if not q:
+        return
+    await q.answer()
+
+    store: Storage = context.application.bot_data["store"]
+
+    if q.data == SETUP_START_CB:
+        await asyncio.to_thread(store.set_onboarding, SETUP_STEP_BASE, {})
+        await q.edit_message_text(
+            "Setup guidato: Step 1/6: scegli la valuta base.",
+            reply_markup=_setup_keyboard_base(),
+        )
+        return
+
+    if q.data == SETUP_CANCEL_CB:
+        await asyncio.to_thread(store.clear_onboarding)
+        await q.edit_message_text("Setup annullato.")
+        return
+
+    ob = await asyncio.to_thread(store.get_onboarding)
+    data = ob.get("data", {})
+
+    if q.data.startswith(SETUP_BASE_PREFIX):
+        cur = q.data.split(":", 1)[1].upper()
+        data["base_currency"] = cur
+        await asyncio.to_thread(store.set_onboarding, SETUP_STEP_CAPITAL, data)
+        await q.edit_message_text(f"Valuta base impostata: {cur}")
+        await _setup_advance_prompt(context, SETUP_STEP_CAPITAL)
+        return
+
+    if q.data.startswith(SETUP_RISK_PREFIX):
+        mode = q.data.split(":", 1)[1].lower()
+        if mode not in RISK_PROFILES:
+            return
+        data["risk_mode"] = mode
+        await asyncio.to_thread(store.set_onboarding, SETUP_STEP_SCAN, data)
+        await q.edit_message_text(f"Risk mode impostato: {mode}")
+        await _setup_advance_prompt(context, SETUP_STEP_SCAN)
+        return
+
+    if q.data.startswith(SETUP_SCAN_PREFIX):
+        v = _parse_float(q.data.split(":", 1)[1])
+        if v is None or v <= 0:
+            return
+        data["scan_interval_seconds"] = int(v)
+        await asyncio.to_thread(store.set_onboarding, SETUP_STEP_PAIRS, data)
+        await q.edit_message_text(f"Scan interval impostato: {int(v)}s")
+        await _setup_advance_prompt(context, SETUP_STEP_PAIRS)
+        return
+
+    if q.data.startswith(SETUP_PAIRS_PREFIX):
+        v = _parse_float(q.data.split(":", 1)[1])
+        if v is None or v <= 0:
+            return
+        data["pairs_limit"] = int(v)
+        await asyncio.to_thread(store.set_onboarding, SETUP_STEP_HARDMIN, data)
+        await q.edit_message_text(f"Pairs limit impostato: {int(v)}")
+        await _setup_advance_prompt(context, SETUP_STEP_HARDMIN)
+        return
+
+    if q.data.startswith(SETUP_HARDMIN_PREFIX):
+        v = _parse_float(q.data.split(":", 1)[1])
+        if v is None or v < 0 or v >= 60:
+            return
+        data["hard_close_minute"] = int(v)
+        await asyncio.to_thread(store.set_onboarding, SETUP_STEP_CONFIRM, data)
+        await q.edit_message_text(f"Hard-close alert impostato: 19:{int(v):02d}")
+        await _setup_advance_prompt(context, SETUP_STEP_CONFIRM)
+        return
+
+    if q.data == SETUP_CONFIRM_CB:
+        # Save into settings + advise which env vars remain required
+        st = await asyncio.to_thread(store.get_settings)
+        base = data.get("base_currency", st.get("base_currency", "EUR"))
+        capital = float(data.get("starting_capital", st.get("starting_capital", 0.0)))
+        risk_mode = data.get("risk_mode", st.get("risk_mode", "aggressive"))
+        await asyncio.to_thread(
+            store.update_settings,
+            base_currency=base,
+            starting_capital=capital,
+            risk_mode=risk_mode,
+        )
+
+        # Apply runtime-only settings by updating cfg in memory for this process.
+        # Note: scan interval/pairs limit/hard-close minute are loaded from ENV at startup; we keep them in onboarding summary
+        # and show the user what to set if they want to persist via ENV.
+        await asyncio.to_thread(store.clear_onboarding)
+        await q.edit_message_text(
+            "Setup salvato ✅\n\n"
+            "Se vuoi rendere persistenti anche *scan interval*, *pairs limit* e *hard-close minute* tra deploy, "
+            "impostali come ENV: `SCAN_INTERVAL_SECONDS`, `PAIRS_LIMIT`, `HARD_CLOSE_MINUTE`.",
+        )
+        return
+
+
+async def on_setup_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    cfg: AppConfig = context.application.bot_data["cfg"]
+    if not _authorized(cfg, update):
+        return
+    owner = await _get_owner_chat_id(context)
+    chat = update.effective_chat
+    if owner is not None and chat and chat.id != owner:
+        return
+    if not update.message or not update.message.text:
+        return
+
+    store: Storage = context.application.bot_data["store"]
+    ob = await asyncio.to_thread(store.get_onboarding)
+    step = ob.get("step")
+    data = ob.get("data", {})
+    if step != SETUP_STEP_CAPITAL:
+        return
+
+    amt = _parse_float(update.message.text.strip())
+    if amt is None or amt < 0:
+        await update.message.reply_text("Valore non valido. Scrivi solo un numero, es. `1000`", parse_mode=ParseMode.MARKDOWN)
+        return
+
+    data["starting_capital"] = float(amt)
+    await asyncio.to_thread(store.set_onboarding, SETUP_STEP_RISK, data)
+    await update.message.reply_text(f"Capitale iniziale impostato: {amt:.2f}")
+    await _setup_advance_prompt(context, SETUP_STEP_RISK)
+
+
+async def _compute_pnl_snapshot(
+    cfg: AppConfig,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> dict[str, Any]:
+    """
+    Returns a snapshot dict with realized/unrealized PnL estimates.
+    """
+    store: Storage = context.application.bot_data["store"]
+    client: RevolutXClient = context.application.bot_data["rx"]
+    st = await asyncio.to_thread(store.get_settings)
+    trades = await asyncio.to_thread(store.list_all_trades)
+    positions = await asyncio.to_thread(store.list_positions)
+
+    realized_total = sum(t.realized_pnl or 0.0 for t in trades if t.side == "SELL")
+
+    unreal_total = 0.0
+    priced_positions = 0
+    for p in positions:
+        last_price = await asyncio.to_thread(client.get_last_price, p.symbol)
+        if last_price is None:
+            continue
+        unreal_total += (last_price - p.avg_entry) * p.qty
+        priced_positions += 1
+
+    equity = float(st["starting_capital"]) + realized_total + unreal_total
+    return {
+        "base_currency": st["base_currency"],
+        "starting_capital": float(st["starting_capital"]),
+        "realized_total": realized_total,
+        "unreal_total": unreal_total,
+        "equity": equity,
+        "priced_positions": priced_positions,
+        "open_positions": positions,
+    }
+
+
+async def scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    cfg: AppConfig = context.application.bot_data["cfg"]
+    store: Storage = context.application.bot_data["store"]
+    st = await asyncio.to_thread(store.get_settings)
+    if int(st["paused"]) == 1:
+        return
+
+    now = datetime.now(cfg.tz)
+    run_mode = (st.get("mode") or "session").lower()
+    if run_mode != "always":
+        if not is_within_operating_window(now, cfg.window_start, cfg.window_end):
+            return
+
+    # Prevent overlapping scans (common when an API is slow and the interval is short).
+    scan_lock: asyncio.Lock = context.application.bot_data.setdefault("scan_lock", asyncio.Lock())
+    metrics: dict[str, Any] = context.application.bot_data.setdefault("metrics", {})
+    if scan_lock.locked():
+        metrics["last_scan_note"] = "scan skipped (previous scan still running)"
+        return
+
+    risk = RISK_PROFILES.get(st["risk_mode"], RISK_PROFILES["aggressive"])
+    entry_strategy = (st.get("entry_strategy") or "momentum").lower()
+    breakout_pct = float(st.get("breakout_pct", 0.015))
+    dip_pct = float(st.get("dip_pct", 0.03))
+    md: MarketDataClient = context.application.bot_data["md"]
+    paper_exec: PaperExecutor = context.application.bot_data["paper_exec"]
+    live_exec: LiveRevolutXExecutor = context.application.bot_data["live_exec"]
+    rx: RevolutXClient = context.application.bot_data["rx"]
+
+    async with scan_lock:
+        scan_started_ts = now.timestamp()
+        metrics["last_scan_started"] = scan_started_ts
+        metrics["last_scan_note"] = "scan running"
+
+        try:
+            # Let ENV override DB for scan sizing (Railway-friendly).
+            pairs_limit_cfg = int(_parse_float(os.getenv("PAIRS_LIMIT", str(st.get("pairs_limit", cfg.pairs_limit))) or str(st.get("pairs_limit", cfg.pairs_limit))) or st.get("pairs_limit", cfg.pairs_limit))
+
+            # Load pairs from market data provider.
+            # If provider is Binance, we can optionally scan only "top movers" to find more opportunities.
+            # Default to high-liquidity universe (more overlap with Revolut X).
+            scan_universe = (os.getenv("SCAN_UNIVERSE", "topvolume") or "topvolume").lower().strip()
+            pairs: list[str] = []
+            try:
+                # Cache Revolut public symbols (used both for revx universe and for tradable checks).
+                revx_cache: dict[str, Any] = context.application.bot_data.setdefault("revx_public_symbols_cache", {})
+                revx_ttl = int(os.getenv("REVX_PUBLIC_SYMBOLS_TTL_SECONDS", "60") or "60")
+                now_ts = now.timestamp()
+                revx_symbols: set[str] = set()
+                try:
+                    cached = revx_cache.get("data")
+                    cached_ts = float(revx_cache.get("ts", 0) or 0)
+                    if isinstance(cached, list) and (now_ts - cached_ts) < revx_ttl:
+                        revx_symbols = {str(s).upper() for s in cached}
+                    else:
+                        revx_symbols = await asyncio.to_thread(rx.get_public_symbols)
+                        revx_cache["data"] = sorted(revx_symbols)
+                        revx_cache["ts"] = now_ts
+                except Exception:
+                    revx_symbols = set()
+
+                if scan_universe in ("revx", "revolutx"):
+                    # Scan only symbols that actually exist on Revolut X and match our quote wallets.
+                    # Build quote list from settings (USDC/USDT) so we don't include pairs like *-USD.
+                    raw_q = str(st.get("autotrade_quote_currencies") or st.get("autotrade_quote_currency") or "").strip()
+                    qs: set[str] = set()
+                    if raw_q:
+                        for q in raw_q.split(","):
+                            qq = q.strip().upper()
+                            if qq:
+                                qs.add(qq)
+                    if not qs:
+                        qs = {"USDC", "USDT"}
+                    pairs = sorted([s for s in revx_symbols if s.split("-")[-1].upper() in qs])
+                    metrics["scan_universe"] = "revx"
+                    metrics["revx_public_symbols_count"] = len(revx_symbols)
+                    if not pairs:
+                        # If we couldn't fetch symbols, don't get stuck scanning alphabetic Binance list.
+                        # Fall back to a curated "majors" list that is very likely tradable on Revolut.
+                        scan_universe = "revxmajors(fallback)"
+
+                if scan_universe in ("revxmajors", "majors", "revxmajors(fallback)"):
+                    # Scan a curated list of major bases, using market data quote (usually USDT) for momentum,
+                    # then map to Revolut quotes (USDC/USDT) at execution time.
+                    raw = os.getenv(
+                        "REVX_BASE_CANDIDATES",
+                        "BTC,ETH,SOL,XRP,ADA,DOGE,AVAX,DOT,LINK,MATIC,UNI,LTC,BCH,TRX,APT,ARB,OP,ATOM,NEAR,TON,PEPE,SHIB",
+                    )
+                    bases = [b.strip().upper() for b in raw.split(",") if b.strip()]
+                    md_quote = str(context.application.bot_data.get("md_quote", "USDT")).upper()
+                    pairs = [f"{b}-{md_quote}" for b in bases]
+                    metrics["scan_universe"] = "revxmajors"
+
+                if scan_universe == "topmovers" and hasattr(md, "get_top_movers"):
+                    pairs = await asyncio.to_thread(getattr(md, "get_top_movers"), pairs_limit_cfg)
+                    metrics["scan_universe"] = "topmovers"
+                if scan_universe == "topvolume" and hasattr(md, "get_top_volume"):
+                    pairs = await asyncio.to_thread(getattr(md, "get_top_volume"), pairs_limit_cfg)
+                    metrics["scan_universe"] = "topvolume"
+                if not pairs:
+                    pairs = await asyncio.to_thread(md.get_pairs)
+                    metrics["scan_universe"] = "all"
+            except Exception as e:
+                metrics["scans_err"] = int(metrics.get("scans_err", 0)) + 1
+                metrics["last_error"] = f"get_pairs error: {repr(e)}"
+                metrics["last_scan_note"] = "get_pairs exception"
+                metrics["last_scan_completed"] = datetime.now(cfg.tz).timestamp()
+                return
+
+            metrics["last_pairs_count"] = len(pairs) if pairs is not None else None
+            if not pairs:
+                metrics["scans_ok"] = int(metrics.get("scans_ok", 0)) + 1
+                metrics["last_scan_note"] = "get_pairs returned empty"
+                metrics["last_scan_completed"] = datetime.now(cfg.tz).timestamp()
+                return
+            pairs_limit = int(pairs_limit_cfg)
+            pairs = pairs[:pairs_limit]
+
+            last_signal_by_symbol: dict[str, float] = context.application.bot_data.setdefault("last_signal_by_symbol", {})
+            last_mom15_sign: dict[str, int] = context.application.bot_data.setdefault("last_mom15_sign", {})
+
+            autotrade_on = int(st.get("autotrade_enabled", 0)) == 1
+            # Multi-quote support: use both wallets (e.g. USDC+USDT) if configured.
+            raw_quotes = str(st.get("autotrade_quote_currencies") or "").strip()
+            quotes: list[str] = []
+            if raw_quotes:
+                for q in raw_quotes.split(","):
+                    qq = q.strip().upper()
+                    if qq:
+                        quotes.append(qq)
+            if not quotes:
+                quotes = [str(st.get("autotrade_quote_currency", "USDT")).upper()]
+            # Prefer USDC first (user preference), then USDT, then others.
+            def _qrank(q: str) -> int:
+                if q == "USDC":
+                    return 0
+                if q == "USDT":
+                    return 1
+                return 2
+            quotes = sorted(list(dict.fromkeys(quotes)), key=_qrank)
+
+            max_pos = int(st.get("autotrade_max_positions", 3))
+            exec_mode = str(st.get("autotrade_mode", "paper")).lower()
+            executor = live_exec if exec_mode == "live" else paper_exec
+            candidates_by_quote: dict[str, list[tuple[str, Any]]] = {}
+            # Effective caps per quote (fixed/balance/compound).
+            base_cap = float(st.get("autotrade_max_quote", 100.0))
+            cap_mode = str(st.get("autotrade_cap_mode", "fixed")).lower().strip()
+            if cap_mode not in ("fixed", "balance", "compound"):
+                cap_mode = "fixed"
+
+            # Parse caps json if present (e.g. {"USDC":100,"USDT":100})
+            caps_map: dict[str, float] = {}
+            raw_caps = str(st.get("autotrade_caps_json") or "").strip()
+            if raw_caps:
+                try:
+                    obj = json.loads(raw_caps)
+                    if isinstance(obj, dict):
+                        for k, v in obj.items():
+                            kk = str(k).upper().strip()
+                            try:
+                                caps_map[kk] = float(v)
+                            except Exception:
+                                continue
+                except Exception:
+                    caps_map = {}
+            if not caps_map:
+                # Default: same base cap for all active quotes.
+                caps_map = {q: base_cap for q in quotes}
+
+            # Get live balances once (if live) and map available by currency.
+            avail_map: dict[str, float] = {}
+            if exec_mode == "live":
+                balances = await asyncio.to_thread(rx.get_balances)
+                if isinstance(balances, list):
+                    for row in balances:
+                        if not isinstance(row, dict):
+                            continue
+                        cur = str(row.get("currency", "")).upper()
+                        try:
+                            avail_map[cur] = float(row.get("available"))
+                        except Exception:
+                            continue
+
+            effective_caps: dict[str, float] = {}
+            for q in quotes:
+                base_q_cap = float(caps_map.get(q, base_cap))
+                avail = avail_map.get(q)
+                realized = 0.0
+                if cap_mode == "compound":
+                    realized = await asyncio.to_thread(store.sum_realized_pnl_for_quote, q)
+                    if realized < 0:
+                        realized = 0.0
+                qcap = base_q_cap
+                if cap_mode == "balance":
+                    if avail is not None:
+                        qcap = min(base_q_cap, float(avail))
+                elif cap_mode == "compound":
+                    qcap = base_q_cap + float(realized)
+                    if avail is not None:
+                        qcap = min(qcap, float(avail))
+                effective_caps[q] = float(qcap)
+
+            metrics["cap_mode"] = cap_mode
+            metrics["cap_effective"] = float(effective_caps.get(quotes[0], base_cap)) if quotes else float(base_cap)
+            metrics["cap_available"] = None
+            metrics["cap_effective_by_quote"] = dict(effective_caps)
+            metrics["cap_available_by_quote"] = dict(avail_map)
+
+            # Cache for "is this tradable on Revolut X?" checks
+            pair_cache: dict[str, Any] = context.application.bot_data.setdefault("revx_pair_cache", {})
+            cache_ttl_seconds = int(os.getenv("REVX_PAIR_CACHE_TTL_SECONDS", "21600"))  # 6h
+
+            def _base_from_market_symbol(market_symbol: str) -> str:
+                return market_symbol.split("-")[0].upper()
+
+            async def _revx_pair_exists(symbol: str) -> bool:
+                now_ts = now.timestamp()
+                cached = pair_cache.get(symbol)
+                if cached and isinstance(cached, dict):
+                    if (now_ts - float(cached.get("ts", 0))) < cache_ttl_seconds:
+                        return bool(cached.get("ok", False))
+                # Prefer public symbol list membership (more reliable than trades/private existence).
+                ok = False
+                try:
+                    revx_cache = context.application.bot_data.get("revx_public_symbols_cache", {})
+                    data = revx_cache.get("data")
+                    if isinstance(data, list) and data:
+                        ok = symbol.upper() in {str(s).upper() for s in data}
+                except Exception:
+                    ok = False
+                if not ok:
+                    ok = await asyncio.to_thread(rx.pair_exists_via_trades_private, symbol)
+                pair_cache[symbol] = {"ok": ok, "ts": now_ts}
+                return ok
+
+            # Fetch candles concurrently (prevents "N*timeout" stalls when provider is slow).
+            scan_concurrency = int(os.getenv("SCAN_CONCURRENCY", "8"))
+            sem = asyncio.Semaphore(max(1, scan_concurrency))
+
+            async def _fetch(symbol: str) -> tuple[str, Any | None, list[dict[str, Any]]]:
+                async with sem:
+                    candles = await asyncio.to_thread(md.get_candles, symbol, "5m", 13)
+                mom = compute_momentum_from_5m_candles(symbol, candles)
+                return symbol, mom, candles
+
+            fetch_results = await asyncio.gather(*(_fetch(s) for s in pairs), return_exceptions=True)
+            metrics["scan_pairs_scanned"] = len(pairs)
+            metrics["scan_mom_hits"] = 0
+            metrics["scan_tradable_hits"] = 0
+            metrics["scan_best_mom15"] = None
+            metrics["scan_best_symbol"] = None
+
+            # Scan momentum for candidate BUY signals
+            try:
+                for r in fetch_results:
+                    if isinstance(r, Exception):
+                        continue
+                    symbol, mom, candles = r
+                    if not mom:
+                        continue
+
+                    # Best-effort telemetry: track best 15m momentum seen.
+                    try:
+                        if metrics.get("scan_best_mom15") is None or float(mom.mom_15m) > float(metrics["scan_best_mom15"]):
+                            metrics["scan_best_mom15"] = float(mom.mom_15m)
+                            metrics["scan_best_symbol"] = symbol
+                    except Exception:
+                        pass
+
+                    entry: EntrySignal | None = None
+                    if entry_strategy == "momentum":
+                        if mom.mom_1h >= risk.mom_1h_threshold and mom.mom_15m >= risk.mom_15m_threshold:
+                            entry = EntrySignal(
+                                kind="momentum",
+                                symbol=symbol,
+                                last_price=mom.last_price,
+                                mom_1h=mom.mom_1h,
+                                mom_15m=mom.mom_15m,
+                                reason=f"mom_1h {fmt_pct(mom.mom_1h)}≥{fmt_pct(risk.mom_1h_threshold)} AND mom_15m {fmt_pct(mom.mom_15m)}≥{fmt_pct(risk.mom_15m_threshold)}",
+                            )
+                    elif entry_strategy == "ranked":
+                        # "Ranked" momentum: lower thresholds + ranking.
+                        # Goal: generate more entries than strict 6%/3% momentum.
+                        if risk.name == "aggressive":
+                            min_1h, min_15m = 0.02, 0.012
+                        elif risk.name == "conservative":
+                            min_1h, min_15m = 0.01, 0.006
+                        else:
+                            min_1h, min_15m = 0.015, 0.008
+                        if mom.mom_1h >= min_1h and mom.mom_15m >= min_15m:
+                            entry = EntrySignal(
+                                kind="ranked",
+                                symbol=symbol,
+                                last_price=mom.last_price,
+                                mom_1h=mom.mom_1h,
+                                mom_15m=mom.mom_15m,
+                                reason=f"ranked momentum: mom_1h {fmt_pct(mom.mom_1h)}≥{fmt_pct(min_1h)} AND mom_15m {fmt_pct(mom.mom_15m)}≥{fmt_pct(min_15m)}",
+                            )
+                    elif entry_strategy == "breakout":
+                        entry = compute_breakout_signal(symbol, candles, breakout_pct)
+                        # keep mom for ranking if available
+                        if entry:
+                            entry = EntrySignal(
+                                kind=entry.kind,
+                                symbol=entry.symbol,
+                                last_price=entry.last_price,
+                                reason=entry.reason,
+                                mom_1h=mom.mom_1h,
+                                mom_15m=mom.mom_15m,
+                            )
+                    elif entry_strategy == "dip":
+                        entry = compute_dip_signal(symbol, candles, dip_pct)
+                        if entry:
+                            entry = EntrySignal(
+                                kind=entry.kind,
+                                symbol=entry.symbol,
+                                last_price=entry.last_price,
+                                reason=entry.reason,
+                                mom_1h=mom.mom_1h,
+                                mom_15m=mom.mom_15m,
+                            )
+
+                    if entry:
+                        metrics["scan_mom_hits"] = int(metrics.get("scan_mom_hits", 0)) + 1
+                        # Multi-quote: try BASE-USDC then BASE-USDT (etc) and take first tradable.
+                        base = _base_from_market_symbol(symbol)
+                        revx_symbol = None
+                        revx_quote = None
+                        for q in quotes:
+                            cand = f"{base}-{q}"
+                            if await _revx_pair_exists(cand):
+                                revx_symbol = cand
+                                revx_quote = q
+                                break
+                        if revx_symbol and revx_quote:
+                            metrics["scan_tradable_hits"] = int(metrics.get("scan_tradable_hits", 0)) + 1
+                            # send signal only if tradable on Revolut X
+                            now_ts = now.timestamp()
+                            last_ts = float(last_signal_by_symbol.get(revx_symbol, 0.0))
+                            if now_ts - last_ts >= cfg.signal_cooldown_seconds:
+                                last_signal_by_symbol[revx_symbol] = now_ts
+                                owner = await _get_owner_chat_id(context)
+                                if owner is not None:
+                                    parts = [
+                                        "*CANDIDATE BUY (tradable on Revolut X)*",
+                                        f"- market symbol: `{symbol}` (source: {context.application.bot_data.get('md_provider','market')})",
+                                        f"- revolut symbol: `{revx_symbol}`",
+                                        f"- market price: `{entry.last_price:.8g}`",
+                                        f"- strategy: `{entry.kind}`",
+                                    ]
+                                    if entry.mom_1h is not None:
+                                        parts.append(f"- momentum 1h: `{fmt_pct(entry.mom_1h)}`")
+                                    if entry.mom_15m is not None:
+                                        parts.append(f"- momentum 15m: `{fmt_pct(entry.mom_15m)}`")
+                                    cap_here = float(effective_caps.get(revx_quote, base_cap))
+                                    parts.append(f"- cap totale: `{cap_here:.2f} {revx_quote}`")
+                                    parts.append("")
+                                    parts.append(f"_Motivo: {entry.reason}_")
+                                    await context.application.bot.send_message(
+                                        chat_id=owner,
+                                        text="\n".join(parts),
+                                        parse_mode=ParseMode.MARKDOWN,
+                                    )
+                                    metrics["signals_sent"] = int(metrics.get("signals_sent", 0)) + 1
+                                    metrics["last_signal_ts"] = now_ts
+
+                            if autotrade_on:
+                                candidates_by_quote.setdefault(revx_quote, []).append((revx_symbol, entry))
+
+                    # Track sign of mom_15m (for reversal alerts on open positions)
+                    mom_sign = 1 if mom.mom_15m > 0 else (-1 if mom.mom_15m < 0 else 0)
+                    last_mom15_sign[symbol] = mom_sign
+                    # Also store for possible Revolut symbols across active quotes.
+                    base = _base_from_market_symbol(symbol)
+                    for q in quotes:
+                        last_mom15_sign[f"{base}-{q}"] = mom_sign
+            except Exception as e:
+                metrics["scans_err"] = int(metrics.get("scans_err", 0)) + 1
+                metrics["last_error"] = f"scan loop error: {repr(e)}"
+                metrics["last_scan_note"] = "scan loop exception"
+                metrics["last_scan_completed"] = datetime.now(cfg.tz).timestamp()
+                return
+
+            # AUTO BUY: open up to max_pos positions per quote, total exposure <= cap per quote.
+            if autotrade_on and candidates_by_quote:
+                def _rank(item):
+                    ent = item[1]
+                    return float(ent.mom_15m) if getattr(ent, "mom_15m", None) is not None else 0.0
+
+                owner = await _get_owner_chat_id(context)
+                if owner is not None:
+                    for q in quotes:
+                        candidates = candidates_by_quote.get(q) or []
+                        if not candidates:
+                            continue
+                        candidates.sort(key=_rank, reverse=True)
+                        quote_cap = float(effective_caps.get(q, base_cap))
+                        for symbol, entry in candidates:
+                            open_notional = await asyncio.to_thread(total_open_notional, store, q)
+                            remaining = max(0.0, quote_cap - float(open_notional))
+                        # For higher turnover, avoid "all-in" on the first trade:
+                        # default spend = cap/max_positions, or override via ENV.
+                        per_trade = _parse_float(os.getenv("AUTOTRADE_PER_TRADE_QUOTE", "0") or "0")
+                        per_trade_quote = per_trade if per_trade and per_trade > 0 else None
+                        decision = decide_autobuy(
+                            store=store,
+                            symbol=symbol,
+                            quote_cap_total=quote_cap,
+                            quote_currency=q,
+                            min_trade_quote=10.0,
+                            max_positions=max_pos,
+                            per_trade_quote=per_trade_quote,
+                        )
+                        if decision.action != "BUY" or not decision.quote_amount:
+                            continue
+                        spend = min(float(decision.quote_amount), remaining)
+                        if spend < 10.0:
+                            continue
+                        res = await asyncio.to_thread(executor.buy_quote, symbol, spend)
+                        if res.ok:
+                            metrics["last_trade_action"] = f"BUY {symbol} {spend:.2f} {q} ({exec_mode})"
+                            metrics["last_trade_ts"] = now.timestamp()
+                            await context.application.bot.send_message(
+                                chat_id=owner,
+                                text=(
+                                    "AUTO BUY\n"
+                                    f"- symbol: {symbol}\n"
+                                    f"- spent: {spend:.2f} {q} (cap totale {quote_cap:.2f}, residuo pre-buy {remaining:.2f})\n"
+                                    f"- price: {res.fill_price if res.fill_price is not None else 'n/a'}\n"
+                                    f"- strategy: {entry.kind}\n"
+                                    f"- motivo: {entry.reason}\n"
+                                    f"- max_positions: {max_pos} cap totale={quote_cap:.2f} {q}\n"
+                                    f"- order_id: {res.order_id}\n"
+                                ),
+                            )
+                        else:
+                            metrics["last_trade_action"] = f"BUY FAILED {symbol} ({exec_mode})"
+                            metrics["last_trade_ts"] = now.timestamp()
+                            metrics["last_error"] = f"last trade error: {res.error}"
+                            await context.application.bot.send_message(chat_id=owner, text=f"AUTO BUY FAILED\n- symbol: {symbol}\n- error: {res.error}")
+                        # Stop if we've filled the cap or reached max positions
+                        open_notional2 = await asyncio.to_thread(total_open_notional, store, q)
+                        if open_notional2 >= quote_cap - 1e-6:
+                            break
+
+            # Evaluate trailing stops / reversal alerts for OPEN positions
+            positions = await asyncio.to_thread(store.list_positions)
+            for p in positions:
+                # For Revolut-traded symbols (e.g. *-USDC), use Revolut X last price.
+                last_price = await asyncio.to_thread(rx.get_last_price, p.symbol)
+                if last_price is None:
+                    last_price = await asyncio.to_thread(md.get_last_price, p.symbol)
+                if last_price is None:
+                    continue
+
+                # If autotrade enabled, allow "take profit" to increase turnover.
+                take_profit_pct = _parse_float(os.getenv("TAKE_PROFIT_PCT", "0.012") or "0.012") or 0.012
+                max_hold_min = int(_parse_float(os.getenv("MAX_HOLD_MINUTES", "180") or "180") or 180)
+                try:
+                    opened = datetime.fromisoformat(p.opened_ts_utc.replace("Z", "+00:00"))
+                except Exception:
+                    opened = None
+                hold_minutes = None
+                if opened is not None:
+                    hold_minutes = (datetime.now(timezone.utc) - opened).total_seconds() / 60.0
+                # Take profit
+                if int(st.get("autotrade_enabled", 0)) == 1 and p.avg_entry > 0 and last_price >= p.avg_entry * (1.0 + float(take_profit_pct)):
+                    owner = await _get_owner_chat_id(context)
+                    if owner is not None:
+                        exec_mode = str(st.get("autotrade_mode", "paper")).lower()
+                        ex = live_exec if exec_mode == "live" else paper_exec
+                        res = await asyncio.to_thread(ex.sell_all, p.symbol)
+                        if res.ok:
+                            pnl_quote = (last_price - p.avg_entry) * p.qty
+                            pct = ((last_price - p.avg_entry) / p.avg_entry) if p.avg_entry else 0.0
+                            metrics["last_trade_action"] = f"SELL {p.symbol} ({exec_mode}) take-profit pnl≈{pnl_quote:+.2f}"
+                            metrics["last_trade_ts"] = now.timestamp()
+                            await context.application.bot.send_message(
+                                chat_id=owner,
+                                text=(
+                                    "AUTO SELL (take profit)\n"
+                                    f"- symbol: {p.symbol}\n"
+                                    f"- last: {last_price:.8g}\n"
+                                    f"- entry: {p.avg_entry:.8g}\n"
+                                    f"- pnl≈ {pnl_quote:+.2f} ({pct*100:+.2f}%)\n"
+                                    f"- reason: last >= entry*(1+{take_profit_pct*100:.2f}%)\n"
+                                    f"- order_id: {res.order_id}\n"
+                                ),
+                            )
+                            continue
+
+                # Time exit (recycle capital if nothing happens)
+                if int(st.get("autotrade_enabled", 0)) == 1 and hold_minutes is not None and hold_minutes >= float(max_hold_min):
+                    owner = await _get_owner_chat_id(context)
+                    if owner is not None:
+                        exec_mode = str(st.get("autotrade_mode", "paper")).lower()
+                        ex = live_exec if exec_mode == "live" else paper_exec
+                        res = await asyncio.to_thread(ex.sell_all, p.symbol)
+                        if res.ok:
+                            pnl_quote = (last_price - p.avg_entry) * p.qty
+                            pct = ((last_price - p.avg_entry) / p.avg_entry) if p.avg_entry else 0.0
+                            metrics["last_trade_action"] = f"SELL {p.symbol} ({exec_mode}) time-exit pnl≈{pnl_quote:+.2f}"
+                            metrics["last_trade_ts"] = now.timestamp()
+                            await context.application.bot.send_message(
+                                chat_id=owner,
+                                text=(
+                                    "AUTO SELL (time exit)\n"
+                                    f"- symbol: {p.symbol}\n"
+                                    f"- last: {last_price:.8g}\n"
+                                    f"- entry: {p.avg_entry:.8g}\n"
+                                    f"- held: {hold_minutes:.1f} min\n"
+                                    f"- pnl≈ {pnl_quote:+.2f} ({pct*100:+.2f}%)\n"
+                                    f"- reason: held >= {max_hold_min} min\n"
+                                    f"- order_id: {res.order_id}\n"
+                                ),
+                            )
+                            continue
+
+                # Update peak
+                if last_price > p.peak_price:
+                    await asyncio.to_thread(store.update_peak, p.symbol, last_price)
+                    peak = last_price
+                else:
+                    peak = p.peak_price
+
+                # Trailing stop alert
+                if last_price <= peak * (1.0 - risk.trailing_stop_pct):
+                    owner = await _get_owner_chat_id(context)
+                    if owner is None:
+                        continue
+                    # If autotrade enabled: auto-sell
+                    if int(st.get("autotrade_enabled", 0)) == 1:
+                        exec_mode = str(st.get("autotrade_mode", "paper")).lower()
+                        ex = live_exec if exec_mode == "live" else paper_exec
+                        res = await asyncio.to_thread(ex.sell_all, p.symbol)
+                        if res.ok:
+                            # realized PnL is stored by storage.add_sell; compute quick % vs entry
+                            pnl_quote = (last_price - p.avg_entry) * p.qty
+                            pct = ((last_price - p.avg_entry) / p.avg_entry) if p.avg_entry else 0.0
+                            metrics["last_trade_action"] = f"SELL {p.symbol} ({exec_mode}) pnl≈{pnl_quote:+.2f}"
+                            metrics["last_trade_ts"] = now.timestamp()
+                            await context.application.bot.send_message(
+                                chat_id=owner,
+                                text=(
+                                    "AUTO SELL (trailing stop)\n"
+                                    f"- symbol: {p.symbol}\n"
+                                    f"- last: {last_price:.8g}\n"
+                                    f"- entry: {p.avg_entry:.8g}\n"
+                                    f"- peak: {peak:.8g}\n"
+                                    f"- pnl≈ {pnl_quote:+.2f} ({pct*100:+.2f}%)\n"
+                                    f"- reason: last <= peak*(1-{risk.trailing_stop_pct*100:.2f}%)\n"
+                                    f"- order_id: {res.order_id}\n"
+                                ),
+                            )
+                            continue
+                        else:
+                            await context.application.bot.send_message(
+                                chat_id=owner,
+                                text=f"AUTO SELL FAILED\n- symbol: {p.symbol}\n- error: {res.error}",
+                            )
+                    await context.application.bot.send_message(
+                        chat_id=owner,
+                        text=(
+                            "*EXIT ALERT (trailing stop)*\n"
+                            f"- symbol: `{p.symbol}`\n"
+                            f"- last: `{last_price:.8g}`\n"
+                            f"- peak: `{peak:.8g}`\n"
+                            f"- trailing: `{fmt_pct(risk.trailing_stop_pct)}`\n\n"
+                            "_Il bot non può chiudere posizioni: chiudi manualmente se necessario._"
+                        ),
+                        parse_mode=ParseMode.MARKDOWN,
+                    )
+
+                # Reversal: mom_15m negative after being positive (best-effort)
+                candles = await asyncio.to_thread(md.get_candles, p.symbol, "5m", 13)
+                sig = compute_momentum_from_5m_candles(p.symbol, candles)
+                if sig:
+                    prev = last_mom15_sign.get(p.symbol, 0)
+                    cur = 1 if sig.mom_15m > 0 else (-1 if sig.mom_15m < 0 else 0)
+                    last_mom15_sign[p.symbol] = cur
+                    if prev > 0 and cur < 0:
+                        owner = await _get_owner_chat_id(context)
+                        if owner is None:
+                            continue
+                        await context.application.bot.send_message(
+                            chat_id=owner,
+                            text=(
+                                "*EXIT ALERT (reversal 15m)*\n"
+                                f"- symbol: `{p.symbol}`\n"
+                                f"- momentum 15m: `{fmt_pct(sig.mom_15m)}`\n\n"
+                                "_Il bot non può chiudere posizioni: chiudi manualmente se necessario._"
+                            ),
+                            parse_mode=ParseMode.MARKDOWN,
+                        )
+
+            metrics["scans_ok"] = int(metrics.get("scans_ok", 0)) + 1
+            metrics["last_scan_note"] = "scan completed"
+            metrics["last_scan_completed"] = datetime.now(cfg.tz).timestamp()
+        finally:
+            # If something unexpected happened and we returned without setting completion,
+            # mark completion to avoid "started but never completed" statuses forever.
+            if metrics.get("last_scan_started") == scan_started_ts and metrics.get("last_scan_completed") is None:
+                metrics["last_scan_completed"] = datetime.now(cfg.tz).timestamp()
+
+
+async def status_ping_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    cfg: AppConfig = context.application.bot_data["cfg"]
+    owner = await _get_owner_chat_id(context)
+    if owner is None:
+        return
+    store: Storage = context.application.bot_data["store"]
+    st = await asyncio.to_thread(store.get_settings)
+    run_mode = (st.get("mode") or "session").lower()
+    always = os.getenv("STATUS_PING_ALWAYS", "0") == "1" or run_mode == "always" or int(st.get("autotrade_enabled", 0)) == 1
+    now = datetime.now(cfg.tz)
+    if not always and not is_within_operating_window(now, cfg.window_start, cfg.window_end):
+        return
+    await context.application.bot.send_message(chat_id=owner, text=await _build_status_text(context))
+
+async def hourly_report_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """
+    Hourly operational report: wallet snapshot + open positions + last actions.
+    """
+    cfg: AppConfig = context.application.bot_data["cfg"]
+    owner = await _get_owner_chat_id(context)
+    if owner is None:
+        return
+    store: Storage = context.application.bot_data["store"]
+    st = await asyncio.to_thread(store.get_settings)
+    if int(st.get("autotrade_enabled", 0)) != 1 and (st.get("mode") or "session") != "always":
+        return
+    rx: RevolutXClient = context.application.bot_data["rx"]
+    balances = await asyncio.to_thread(rx.get_balances)
+    md: MarketDataClient = context.application.bot_data["md"]
+    positions = await asyncio.to_thread(store.list_positions)
+    metrics: dict[str, Any] = context.application.bot_data.setdefault("metrics", {})
+
+    lines = ["REPORT ORARIO"]
+    lines.append(f"- ora: {datetime.now(cfg.tz).isoformat(timespec='seconds')}")
+    lines.append(f"- autotrade: {bool(int(st.get('autotrade_enabled',0)))} mode={st.get('autotrade_mode','paper')} cap={st.get('autotrade_max_quote')} {st.get('autotrade_quote_currency')}")
+    lines.append(f"- last action: {metrics.get('last_trade_action','n/a')}")
+    if isinstance(balances, list):
+        by_cur = {str(r.get('currency','')).upper(): r for r in balances if isinstance(r, dict)}
+        for cur in ["USDT", "USD"]:
+            if cur in by_cur:
+                lines.append(f"- wallet {cur}: available={by_cur[cur].get('available')} reserved={by_cur[cur].get('reserved')}")
+    # Positions + PnL snapshot
+    if not positions:
+        lines.append("- posizioni aperte: 0")
+    else:
+        lines.append(f"- posizioni aperte: {len(positions)}")
+        for p in positions[:10]:
+            last = await asyncio.to_thread(md.get_last_price, p.symbol)
+            if last is None:
+                lines.append(f"  - {p.symbol}: qty={p.qty:.6g} entry={p.avg_entry:.6g} (last n/a)")
+                continue
+            pnl = (last - p.avg_entry) * p.qty
+            pct = ((last - p.avg_entry) / p.avg_entry) * 100 if p.avg_entry else 0.0
+            lines.append(f"  - {p.symbol}: qty={p.qty:.6g} entry={p.avg_entry:.6g} last={last:.6g} pnl≈{pnl:+.2f} ({pct:+.2f}%)")
+    await context.application.bot.send_message(chat_id=owner, text="\n".join(lines))
+
+
+async def hard_close_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    cfg: AppConfig = context.application.bot_data["cfg"]
+    store: Storage = context.application.bot_data["store"]
+    positions = await asyncio.to_thread(store.list_positions)
+    if not positions:
+        return
+    st = await asyncio.to_thread(store.get_settings)
+    hard_min = int(st.get("hard_close_minute", cfg.hard_close_time.minute))
+    text = (
+        "*CHIUDI TUTTO ORA*\n"
+        f"Sono le 19:{hard_min:02d} ({cfg.tz_name}). Hai posizioni aperte:\n"
+        + "\n".join([f"- `{p.symbol}` qty≈{p.qty:.8g}" for p in positions])
+        + "\n\n_Il bot non può chiudere: chiudi manualmente entro le 20:00._"
+    )
+    owner = await _get_owner_chat_id(context)
+    if owner is None:
+        return
+    await context.application.bot.send_message(chat_id=owner, text=text, parse_mode=ParseMode.MARKDOWN)
+
+
+async def recap_job(context: ContextTypes.DEFAULT_TYPE) -> None:
+    cfg: AppConfig = context.application.bot_data["cfg"]
+    store: Storage = context.application.bot_data["store"]
+
+    st = await asyncio.to_thread(store.get_settings)
+    base = st["base_currency"]
+
+    now_local = datetime.now(cfg.tz)
+    start_local = datetime(year=now_local.year, month=now_local.month, day=now_local.day, tzinfo=cfg.tz)
+    start_utc = start_local.astimezone(timezone.utc).isoformat()
+    trades_today = await asyncio.to_thread(store.list_trades_since_utc, start_utc)
+    realized_today = sum(t.realized_pnl or 0.0 for t in trades_today if t.side == "SELL")
+
+    snap = await _compute_pnl_snapshot(cfg, context)
+    realized_total = float(snap["realized_total"])
+    unreal_total = float(snap["unreal_total"])
+
+    trade_lines = []
+    for t in trades_today:
+        rp = "" if t.realized_pnl is None else f" pnl={t.realized_pnl:+.2f}"
+        trade_lines.append(f"- {t.ts_utc}: {t.side} {t.symbol} amount={t.amount_base:.2f} price={t.price:.8g}{rp}")
+
+    recap = (
+        "*Recap giornaliero (20:00)*\n"
+        f"- Trades oggi: `{len(trades_today)}`\n"
+        + ("(nessuno)\n" if not trade_lines else "\n".join(trade_lines) + "\n")
+        + f"\n*PnL stimato*\n"
+        f"- Realizzato oggi (solo SELL): `{_money(realized_today, base)}`\n"
+        f"- Realizzato totale: `{_money(realized_total, base)}`\n"
+        f"- Non realizzato (snapshot): `{_money(unreal_total, base)}`\n"
+        f"- Equity stimata: `{_money(float(snap['equity']), base)}`\n"
+        "\n_Note: il non realizzato è uno snapshot a fine giornata (dipende dall’ultimo prezzo disponibile)._"
+    )
+
+    owner = await _get_owner_chat_id(context)
+    if owner is None:
+        return
+    await context.application.bot.send_message(
+        chat_id=owner,
+        text=recap,
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+    positions = await asyncio.to_thread(store.list_positions)
+    if positions:
+        await context.application.bot.send_message(
+            chat_id=owner,
+            text=(
+                "*EMERGENZA: posizioni ancora aperte alle 20:00*\n"
+                + "\n".join([f"- `{p.symbol}` qty≈{p.qty:.8g}" for p in positions])
+                + "\n\n_Il bot non può chiudere: chiudi manualmente._"
+            ),
+            parse_mode=ParseMode.MARKDOWN,
+        )
+
+
+def build_app(cfg: AppConfig) -> Application:
+    store = Storage(cfg.db_path)
+    # Bootstrap RevolutX base url/path from settings if present (non-secrets)
+    st = store.get_settings()
+
+    # Apply default settings at process start (not only on /start), so a fresh restart
+    # immediately becomes "operational" even before you send commands.
+    # Can be disabled via ENV: AUTO_DEFAULTS_ON_BOOT=0
+    if os.getenv("AUTO_DEFAULTS_ON_BOOT", "1") != "0":
+        allow_live = os.getenv("ALLOW_LIVE_TRADING", "0") == "1"
+        default_autotrade_mode = (os.getenv("AUTO_DEFAULTS_AUTOTRADE_MODE", "live") or "live").lower().strip()
+        if default_autotrade_mode not in ("paper", "live"):
+            default_autotrade_mode = "live"
+        if default_autotrade_mode == "live" and not allow_live:
+            default_autotrade_mode = "paper"
+        desired_defaults: dict[str, Any] = {
+            "risk_mode": "normal",
+            "autotrade_enabled": 1,
+            "autotrade_mode": default_autotrade_mode,
+            "entry_strategy": (os.getenv("AUTO_DEFAULTS_ENTRY_STRATEGY", "ranked") or "ranked").lower().strip(),
+            "autotrade_cap_mode": (os.getenv("AUTO_DEFAULTS_CAP_MODE", "compound") or "compound").lower().strip(),
+            "pairs_limit": int(_parse_float(os.getenv("PAIRS_LIMIT", str(cfg.pairs_limit)) or str(cfg.pairs_limit)) or cfg.pairs_limit),
+            "scan_interval_seconds": int(_parse_float(os.getenv("SCAN_INTERVAL_SECONDS", str(cfg.scan_interval_seconds)) or str(cfg.scan_interval_seconds)) or cfg.scan_interval_seconds),
+            "autotrade_max_quote": float(_parse_float(os.getenv("AUTO_DEFAULTS_CAP_AMT", "100") or "100") or 100.0),
+            "autotrade_quote_currency": (os.getenv("AUTO_DEFAULTS_CAP_CUR", "USDC") or "USDC").upper().strip(),
+            "autotrade_quote_currencies": (os.getenv("AUTO_DEFAULTS_CAP_CURS", "USDC") or "USDC").upper().strip(),
+            "autotrade_caps_json": (os.getenv("AUTO_DEFAULTS_CAPS_JSON", "") or "").strip() or json.dumps({"USDC": 100.0}),
+            "mode": "always",
+            "paused": 0,
+            "bootstrapped": 1,
+        }
+        try:
+            needs = any(st.get(k) != v for k, v in desired_defaults.items())
+            if needs:
+                store.update_settings(**desired_defaults)
+                st = store.get_settings()
+        except Exception:
+            # Never block startup on defaults; bot can still be controlled via commands.
+            st = store.get_settings()
+
+    # Optional auto-start configuration via ENV (so you don't need manual commands).
+    # Applied at process start (after redeploy).
+    auto_mode = os.getenv("AUTO_START_MODE")  # "always" | "session"
+    auto_autotrade = os.getenv("AUTO_START_AUTOTRADE")  # "1" or "0"
+    auto_autotrade_mode = os.getenv("AUTO_START_AUTOTRADE_MODE")  # "paper" | "live"
+    auto_cap_amt = os.getenv("AUTO_START_AUTOTRADE_CAP")
+    auto_cap_cur = os.getenv("AUTO_START_AUTOTRADE_CUR")
+    updates: dict[str, Any] = {}
+    if auto_mode in ("always", "session"):
+        updates["mode"] = auto_mode
+    if auto_autotrade in ("1", "0"):
+        updates["autotrade_enabled"] = int(auto_autotrade)
+        if auto_autotrade == "1":
+            updates.setdefault("mode", "always")
+    if auto_autotrade_mode in ("paper", "live"):
+        updates["autotrade_mode"] = auto_autotrade_mode
+    if auto_cap_amt:
+        amt = _parse_float(auto_cap_amt)
+        if amt and amt > 0:
+            updates["autotrade_max_quote"] = float(amt)
+    if auto_cap_cur:
+        updates["autotrade_quote_currency"] = auto_cap_cur.upper()
+    if updates:
+        store.update_settings(**updates)
+        st = store.get_settings()
+    base_url = st.get("revolutx_base_url") or cfg.revolutx_base_url
+    base_path = st.get("revolutx_base_path") or cfg.revolutx_base_path
+    private_pem = os.getenv("REVOLUTX_ED25519_PRIVATE_KEY_PEM")
+    if not private_pem:
+        b64 = os.getenv("REVOLUTX_ED25519_PRIVATE_KEY_PEM_B64")
+        if b64:
+            try:
+                private_pem = base64.b64decode(b64.encode("utf-8")).decode("utf-8")
+            except Exception:
+                private_pem = None
+
+    rx = RevolutXClient(
+        base_url=base_url,
+        base_path=base_path,
+        api_key=cfg.revolutx_api_key,
+        private_key_pem=private_pem,
+        timeout_seconds=cfg.revolutx_timeout_seconds,
+    )
+
+    # Market data provider (default: Binance public, no key)
+    md_provider = os.getenv("MARKET_DATA_PROVIDER", "binance")
+    md_quote = os.getenv("MARKET_DATA_QUOTE", st.get("base_currency", "EUR")) or "EUR"
+    md = create_market_data_client(
+        md_provider,
+        quote=md_quote,
+        timeout_seconds=cfg.revolutx_timeout_seconds,
+        revolutx_base_url=base_url,
+        revolutx_base_path=base_path,
+        revolutx_api_key=cfg.revolutx_api_key,
+    )
+
+    paper_exec = PaperExecutor(md=md, store=store)
+    live_exec = LiveRevolutXExecutor(rx_client=rx, store=store, md=md)
+
+    app = Application.builder().token(cfg.telegram_bot_token).build()
+    app.bot_data["cfg"] = cfg
+    app.bot_data["store"] = store
+    app.bot_data["rx"] = rx
+    app.bot_data["md"] = md
+    app.bot_data["md_provider"] = md_provider
+    app.bot_data["md_quote"] = md_quote
+    app.bot_data["paper_exec"] = paper_exec
+    app.bot_data["live_exec"] = live_exec
+    app.bot_data["last_signal_by_symbol"] = {}
+    app.bot_data["last_mom15_sign"] = {}
+    app.bot_data["metrics"] = {}
+
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("config", cmd_config))
+    app.add_handler(CommandHandler("pause", cmd_pause))
+    app.add_handler(CommandHandler("resume", cmd_resume))
+    app.add_handler(CommandHandler("setcapital", cmd_setcapital))
+    app.add_handler(CommandHandler("setrisk", cmd_setrisk))
+    app.add_handler(CommandHandler("setentry", cmd_setentry))
+    app.add_handler(CommandHandler("buy", cmd_buy))
+    app.add_handler(CommandHandler("sell", cmd_sell))
+    app.add_handler(CommandHandler("portfolio", cmd_portfolio))
+    app.add_handler(CommandHandler("status", cmd_status))
+    app.add_handler(CommandHandler("revxprobe", cmd_revxprobe))
+    app.add_handler(CommandHandler("revxpub", cmd_revxpub))
+    app.add_handler(CommandHandler("wallet", cmd_wallet))
+    app.add_handler(CommandHandler("egressip", cmd_egressip))
+    app.add_handler(CommandHandler("setmode", cmd_setmode))
+    app.add_handler(CommandHandler("autotrade", cmd_autotrade))
+    app.add_handler(CommandHandler("testbuy", cmd_testbuy))
+    app.add_handler(CommandHandler("bootstrap", cmd_bootstrap))
+    app.add_handler(CommandHandler("reset", cmd_reset))
+    app.add_handler(CommandHandler("setup", cmd_setup))
+    app.add_handler(CallbackQueryHandler(on_reset_callback, pattern=f"^{RESET_CONFIRM_CB}$|^{RESET_CANCEL_CB}$"))
+    app.add_handler(CallbackQueryHandler(on_setup_callback, pattern=r"^(setup_|setup_base:|setup_risk:|setup_scan:|setup_pairs:|setup_hardmin:)"))
+    app.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), on_setup_text))
+
+    # Scheduling
+    jq = app.job_queue
+    scan_interval = int(st.get("scan_interval_seconds", cfg.scan_interval_seconds))
+    hard_min = int(st.get("hard_close_minute", cfg.hard_close_time.minute))
+    hard_close_time = cfg.hard_close_time.replace(minute=hard_min)
+    jq.run_repeating(scan_job, interval=scan_interval, first=5, name="scan")
+    jq.run_daily(hard_close_job, time=hard_close_time, name="hard_close")
+    jq.run_daily(recap_job, time=cfg.recap_time, name="recap")
+    status_every_minutes = int(os.getenv("STATUS_PING_MINUTES", "30") or "30")
+    jq.run_repeating(
+        status_ping_job,
+        interval=max(60, status_every_minutes * 60),
+        first=15,
+        name="status_ping",
+    )
+    jq.run_repeating(hourly_report_job, interval=3600, first=60, name="hourly_report")
+
+    # Egress IP report (default: every 12 hours)
+    egress_hours = int(_parse_float(os.getenv("EGRESS_IP_REPORT_HOURS", "12") or "12") or 12)
+    jq.run_repeating(
+        egress_ip_report_job,
+        interval=max(3600, egress_hours * 3600),
+        first=30,
+        name="egress_ip_report",
+    )
+
+    return app
+
+
+def main() -> None:
+    # Always start an HTTP server on $PORT (Railway Web service requirement).
+    # Telegram bot keeps running in the main thread.
+    import uvicorn
+
+    web_port = int(os.getenv("PORT") or os.getenv("WEB_PORT") or "8080")
+    web_host = os.getenv("WEB_HOST", "0.0.0.0")
+
+    # If the Telegram token is missing, we still start the HTTP server so Railway healthchecks pass.
+    token_present = bool(os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("telegram_bot_token"))
+    store_for_http: Storage | None = None
+    app_tg: Application | None = None
+
+    if token_present:
+        cfg = load_config()
+        app_tg = build_app(cfg)
+        store_for_http = app_tg.bot_data.get("store")
+        logger.info("Bot starting. TZ=%s window=09:00-20:00 allowed_chat_id=%s", cfg.tz_name, cfg.telegram_allowed_chat_id)
+    else:
+        logger.error("Missing TELEGRAM_BOT_TOKEN. Starting HTTP-only mode (Railway health will be OK).")
+
+    http_app = create_http_app(store_for_http)
+
+    def _run_http():
+        # Uvicorn is blocking, so run it in a daemon thread.
+        uvicorn.run(http_app, host=web_host, port=web_port, log_level="info")
+
+    t = threading.Thread(target=_run_http, daemon=True)
+    t.start()
+    logger.info("HTTP server listening on %s:%s (PORT=%s).", web_host, web_port, os.getenv("PORT"))
+
+    if app_tg is not None:
+        app_tg.run_polling(close_loop=False, allowed_updates=Update.ALL_TYPES)
+    else:
+        # Keep process alive so Railway doesn't exit.
+        try:
+            while True:
+                threading.Event().wait(3600)
+        except KeyboardInterrupt:
+            return
+
+
+if __name__ == "__main__":
+    main()
+

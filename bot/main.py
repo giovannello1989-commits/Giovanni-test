@@ -33,7 +33,7 @@ from bot.strategy import (
     compute_momentum_from_5m_candles,
     fmt_pct,
 )
-from bot.web import create_web_app
+from bot.http_server import create_http_app
 
 
 logging.basicConfig(
@@ -2203,49 +2203,45 @@ def build_app(cfg: AppConfig) -> Application:
 
 
 def main() -> None:
-    # If Telegram token is missing but web setup is enabled, keep the service alive
-    # and expose a small page that tells what is missing.
-    if os.getenv("ENABLE_WEB_SETUP", "0") == "1" and not (os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("telegram_bot_token")):
-        import uvicorn
-        from fastapi import FastAPI
-        from fastapi.responses import HTMLResponse
+    # Always start an HTTP server on $PORT (Railway Web service requirement).
+    # Telegram bot keeps running in the main thread.
+    import uvicorn
 
-        app_web = FastAPI(docs_url=None, redoc_url=None)
+    web_port = int(os.getenv("PORT") or os.getenv("WEB_PORT") or "8080")
+    web_host = os.getenv("WEB_HOST", "0.0.0.0")
 
-        @app_web.get("/", response_class=HTMLResponse)
-        async def _missing():
-            return HTMLResponse(
-                "<h2>Bot non avviato: manca TELEGRAM_BOT_TOKEN</h2>"
-                "<p>Imposta su Railway (Variables) <code>TELEGRAM_BOT_TOKEN</code> e fai Redeploy.</p>"
-            )
+    # If the Telegram token is missing, we still start the HTTP server so Railway healthchecks pass.
+    token_present = bool(os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("telegram_bot_token"))
+    store_for_http: Storage | None = None
+    app_tg: Application | None = None
 
-        web_port = int(os.getenv("PORT") or os.getenv("WEB_PORT") or "8080")
-        web_host = os.getenv("WEB_HOST", "0.0.0.0")
-        logger.error("Missing TELEGRAM_BOT_TOKEN. Starting web-only helper on port=%s.", web_port)
-        uvicorn.run(app_web, host=web_host, port=web_port, log_level="info")
-        return
+    if token_present:
+        cfg = load_config()
+        app_tg = build_app(cfg)
+        store_for_http = app_tg.bot_data.get("store")
+        logger.info("Bot starting. TZ=%s window=09:00-20:00 allowed_chat_id=%s", cfg.tz_name, cfg.telegram_allowed_chat_id)
+    else:
+        logger.error("Missing TELEGRAM_BOT_TOKEN. Starting HTTP-only mode (Railway health will be OK).")
 
-    cfg = load_config()
-    app = build_app(cfg)
-    logger.info("Bot starting. TZ=%s window=09:00-20:00 allowed_chat_id=%s", cfg.tz_name, cfg.telegram_allowed_chat_id)
+    http_app = create_http_app(store_for_http)
 
-    # Optional web setup wizard (frontend + server)
-    if os.getenv("ENABLE_WEB_SETUP", "0") == "1":
-        store: Storage = app.bot_data["store"]
+    def _run_http():
+        # Uvicorn is blocking, so run it in a daemon thread.
+        uvicorn.run(http_app, host=web_host, port=web_port, log_level="info")
 
-        def _run_web():
-            import uvicorn
+    t = threading.Thread(target=_run_http, daemon=True)
+    t.start()
+    logger.info("HTTP server listening on %s:%s (PORT=%s).", web_host, web_port, os.getenv("PORT"))
 
-            web_port = int(os.getenv("PORT") or os.getenv("WEB_PORT") or "8080")
-            web_host = os.getenv("WEB_HOST", "0.0.0.0")
-            web_app = create_web_app(store)
-            uvicorn.run(web_app, host=web_host, port=web_port, log_level="info")
-
-        t = threading.Thread(target=_run_web, daemon=True)
-        t.start()
-        logger.info("Web setup enabled on port=%s (set SETUP_ADMIN_TOKEN).", os.getenv("PORT") or os.getenv("WEB_PORT") or "8080")
-
-    app.run_polling(close_loop=False, allowed_updates=Update.ALL_TYPES)
+    if app_tg is not None:
+        app_tg.run_polling(close_loop=False, allowed_updates=Update.ALL_TYPES)
+    else:
+        # Keep process alive so Railway doesn't exit.
+        try:
+            while True:
+                threading.Event().wait(3600)
+        except KeyboardInterrupt:
+            return
 
 
 if __name__ == "__main__":

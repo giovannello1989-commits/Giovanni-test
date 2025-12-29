@@ -78,3 +78,23 @@
 2025-12-29 11:18:10,240 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot7761728065:AAFuXF6U7CvNlDLyLi0LxnPRV8ZGNhsJpII/sendMessage "HTTP/1.1 200 OK"
 2025-12-29 11:18:10,241 - apscheduler.executors.default - INFO - Job "trade_job (trigger: interval[0:15:00], next run at: 2025-12-29 11:33:09 UTC)" executed successfully
 2025-12-29 11:18:19,646 - apscheduler.executors.default - INFO - Running job "stock_job (trigger: interval[1:00:00], next run at: 2025-12-29 12:18:19 UTC)" (scheduled at 2025-12-29 11:18:19.635487+00:00)
+2025-12-29 11:18:19,859 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot7761728065:AAFuXF6U7CvNlDLyLi0LxnPRV8ZGNhsJpII/getUpdates "HTTP/1.1 200 OK"
+2025-12-29 11:18:20,437 - yfinance - ERROR - Failed to get ticker '^GSPC' reason: Expecting value: line 1 column 1 (char 0)
+2025-12-29 11:18:20,903 - yfinance - ERROR - ^GSPC: No price data found, symbol may be delisted (period=2d)
+2025-12-29 11:18:20,904 - apscheduler.executors.default - INFO - Job "stock_job (trigger: interval[1:00:00], next run at: 2025-12-29 12:18:19 UTC)" executed successfully
+2025-12-29 11:18:29,975 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot7761728065:AAFuXF6U7CvNlDLyLi0LxnPRV8ZGNhsJpII/getUpdates "HTTP/1.1 200 OK"
+2025-12-29 11:18:40,084 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot7761728065:AAFuXF6U7CvNlDLyLi0LxnPRV8ZGNhsJpII/getUpdates "HTTP/1.1 200 OK"
+2025-12-29 11:18:50,193 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot7761728065:AAFuXF6U7CvNlDLyLi0LxnPRV8ZGNhsJpII/getUpdates "HTTP/1.1 200 OK"
+2025-12-29 11:19:00,302 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot7761728065:AAFuXF6U7CvNlDLyLi0LxnPRV8ZGNhsJpII/getUpdates "HTTP/1.1 200 OK"
+2025-12-29 11:19:10,413 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot7761728065:AAFuXF6U7CvNlDLyLi0LxnPRV8ZGNhsJpII/getUpdates "HTTP/1.1 200 OK"
+2025-12-29 11:19:20,527 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot7761728065:AAFuXF6U7CvNlDLyLi0LxnPRV8ZGNhsJpII/getUpdates "HTTP/1.1 200 OK"
+2025-12-29 11:19:30,636 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot7761728065:AAFuXF6U7CvNlDLyLi0LxnPRV8ZGNhsJpII/getUpdates "HTTP/1.1 200 OK"
+2025-12-29 11:19:40,745 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot7761728065:AAFuXF6U7CvNlDLyLi0LxnPRV8ZGNhsJpII/getUpdates "HTTP/1.1 200 OK"
+2025-12-29 11:19:50,857 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot7761728065:AAFuXF6U7CvNlDLyLi0LxnPRV8ZGNhsJpII/getUpdates "HTTP/1.1 200 OK"
+2025-12-29 11:20:00,967 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot7761728065:AAFuXF6U7CvNlDLyLi0LxnPRV8ZGNhsJpII/getUpdates "HTTP/1.1 200 OK"
+2025-12-29 11:20:11,075 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot7761728065:AAFuXF6U7CvNlDLyLi0LxnPRV8ZGNhsJpII/getUpdates "HTTP/1.1 200 OK"
+2025-12-29 11:20:21,185 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot7761728065:AAFuXF6U7CvNlDLyLi0LxnPRV8ZGNhsJpII/getUpdates "HTTP/1.1 200 OK"
+2025-12-29 11:20:25,544 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot7761728065:AAFuXF6U7CvNlDLyLi0LxnPRV8ZGNhsJpII/getUpdates "HTTP/1.1 200 OK"
+2025-12-29 11:20:25,544 - telegram.ext.Application - INFO - Application is stopping. This might take a moment.
+2025-12-29 11:20:25,544 - apscheduler.scheduler - INFO - Scheduler has been shut down
+2025-12-29 11:20:25,554 - telegram.ext.Application - INFO - Application.stop() complete

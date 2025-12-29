@@ -17,7 +17,8 @@ class RevolutXClient:
         self.session = requests.Session()
         self.session.headers.update({
             "Authorization": f"Bearer {self.api_key}",
-            "Content-Type": "application/json"
+            "Content-Type": "application/json",
+            "User-Agent": "TradingBot/1.0"
         })
 
     def get_price(self, pair="BTC-USD"):
@@ -27,16 +28,38 @@ class RevolutXClient:
             base = 40000 if "BTC" in pair else 2000
             return base * (1 + random.uniform(-0.01, 0.01))
         
+        # Try Official API (Best Guess)
         try:
             # Hypothetical endpoint
             resp = self.session.get(f"{self.base_url}/ticker?symbol={pair}")
             if resp.status_code == 200:
-                data = resp.json()
-                return float(data['last'])
-            return None
+                try:
+                    data = resp.json()
+                    return float(data['last'])
+                except Exception:
+                     logger.warning(f"Revolut API returned non-JSON: {resp.text[:100]}")
+            else:
+                logger.warning(f"Revolut API Error {resp.status_code}: {resp.text[:100]}")
+
         except Exception as e:
-            logger.error(f"Error fetching price: {e}")
-            return None
+            logger.error(f"Error fetching price from Revolut: {e}")
+            
+        # Fallback to CoinGecko (Public API)
+        try:
+            # Map pair to CoinGecko ID
+            cg_id = "bitcoin" if "BTC" in pair else "ethereum"
+            url = f"https://api.coingecko.com/api/v3/simple/price?ids={cg_id}&vs_currencies=usd"
+            headers = {"User-Agent": "TradingBot/1.0"}
+            resp = requests.get(url, headers=headers, timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                return float(data[cg_id]['usd'])
+            else:
+                logger.error(f"CoinGecko Error {resp.status_code}: {resp.text}")
+        except Exception as e:
+            logger.error(f"Error fetching price from CoinGecko: {e}")
+
+        return None
 
     def place_order(self, pair, side, quantity):
         """
@@ -61,7 +84,11 @@ class RevolutXClient:
         }
         try:
             resp = self.session.post(f"{self.base_url}/order", json=payload)
-            return resp.json()
+            if resp.status_code == 200:
+                 return resp.json()
+            else:
+                logger.error(f"Order Error {resp.status_code}: {resp.text}")
+                return None
         except Exception as e:
             logger.error(f"Order failed: {e}")
             return None
@@ -106,11 +133,14 @@ class TradingEngine:
             return "Not initialized"
         
         symbol = "BTC-USD" # Default pair
-        signal = self.analyze_market()
+        
+        # Get Price FIRST to ensure connectivity
         price = self.client.get_price(symbol)
         
         if not price:
-            return "Error fetching price"
+            return "Error fetching price (Check logs)"
+            
+        signal = self.analyze_market()
 
         if signal == "BUY":
             # Buy logic
@@ -138,6 +168,8 @@ class TradingEngine:
                         capital_exposure=get_total_exposure()
                     )
                     return f"Bought {quantity:.6f} BTC"
+                else:
+                     return "Buy failed (API Error)"
             else:
                 return "Buy blocked by capital limit"
 
@@ -167,6 +199,8 @@ class TradingEngine:
                         capital_exposure=get_total_exposure()
                     )
                     return f"Sold {total_qty:.6f} BTC"
+                else:
+                    return "Sell failed (API Error)"
         
         return "No action"
 

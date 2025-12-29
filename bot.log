@@ -1,0 +1,7 @@
+2025-12-29 11:09:39,919 - __main__ - INFO - Starting Trading Bot...
+2025-12-29 11:09:39,964 - bot.crypto_trader - INFO - Trading Engine Initialized. Test Mode: True
+2025-12-29 11:09:42,928 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot7761728065:AAFuXF6U7CvNlDLyLi0LxnPRV8ZGNhsJpII/getMe "HTTP/1.1 200 OK"
+2025-12-29 11:09:43,028 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot7761728065:AAFuXF6U7CvNlDLyLi0LxnPRV8ZGNhsJpII/deleteWebhook "HTTP/1.1 200 OK"
+2025-12-29 11:09:43,029 - apscheduler.scheduler - INFO - Scheduler started
+2025-12-29 11:09:43,029 - telegram.ext.Application - INFO - Application started
+2025-12-29 11:09:53,369 - httpx - INFO - HTTP Request: POST https://api.telegram.org/bot7761728065:AAFuXF6U7CvNlDLyLi0LxnPRV8ZGNhsJpII/getUpdates "HTTP/1.1 200 OK"

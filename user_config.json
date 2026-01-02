@@ -1,0 +1,12 @@
+{
+    "revolut_api_key": "Cvzxjx4NGPi94Y8Xy2uuQi5PwCpc756ezrQEDdvbytI1ikedNrXTnVoyWGNfaCCp",
+    "revolut_api_secret": "",
+    "max_capital": 100.0,
+    "trading_style": "momentum",
+    "stock_alerts_enabled": true,
+    "stock_market": "US",
+    "alert_aggressiveness": "medium",
+    "static_ip": null,
+    "is_configured": false,
+    "admin_chat_id": 371722384
+}

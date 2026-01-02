@@ -5,8 +5,8 @@
     "trading_style": "momentum",
     "stock_alerts_enabled": true,
     "stock_market": "US",
-    "alert_aggressiveness": "low",
-    "static_ip": "34.153.114.74",
-    "is_configured": true,
+    "alert_aggressiveness": "medium",
+    "static_ip": null,
+    "is_configured": false,
     "admin_chat_id": 371722384
 }

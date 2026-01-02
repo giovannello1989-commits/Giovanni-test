@@ -13,7 +13,7 @@ from .database import get_total_exposure, init_db, AuditLog, ForexWatch, ForexHo
 logger = logging.getLogger(__name__)
 
 # States
-EXCHANGE_ID, API_KEY, API_SECRET, EXECUTION_MODE, CONFIRM_CAPITAL, STOCK_ALERTS, STOCK_MARKET, AGGRESSIVENESS, CONFIRM_START = range(9)
+EXCHANGE_ID, API_KEY, API_SECRET, EXECUTION_MODE, TEST_TRADE, CONFIRM_CAPITAL, STOCK_ALERTS, STOCK_MARKET, AGGRESSIVENESS, CONFIRM_START = range(10)
 
 class BotInterface:
     def __init__(self, token):
@@ -37,13 +37,15 @@ class BotInterface:
                 API_KEY: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.receive_api_key)],
                 API_SECRET: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.receive_api_secret)],
                 EXECUTION_MODE: [MessageHandler(filters.Regex("^(PAPER|LIVE)$"), self.receive_execution_mode)],
+                TEST_TRADE: [MessageHandler(filters.Regex("^(RUN_TEST|SKIP)$"), self.test_trade_step)],
                 CONFIRM_CAPITAL: [MessageHandler(filters.Regex("^(Yes|No)$"), self.confirm_capital)],
                 STOCK_ALERTS: [MessageHandler(filters.Regex("^(Yes|No)$"), self.ask_stock_alerts)],
                 STOCK_MARKET: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.choose_stock_market)],
                 AGGRESSIVENESS: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.choose_aggressiveness)],
                 CONFIRM_START: [MessageHandler(filters.Regex("^(START|CANCEL)$"), self.finish_setup)],
             },
-            fallbacks=[CommandHandler("cancel", self.cancel)],
+            fallbacks=[CommandHandler("cancel", self.cancel), CommandHandler("start", self.start_wizard)],
+            allow_reentry=True,
         )
 
         self.application.add_handler(conv_handler)
@@ -70,6 +72,7 @@ class BotInterface:
     async def start_wizard(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_id = update.effective_chat.id
         config_manager.set("admin_chat_id", chat_id)
+        logger.info("Wizard started for chat_id=%s", chat_id)
         
         await update.message.reply_text(
             "👋 Welcome to your Automated Trading Bot!\n\n"
@@ -122,10 +125,38 @@ class BotInterface:
     async def receive_execution_mode(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         mode = update.message.text.strip().upper()
         config_manager.set("execution_mode", "live" if mode == "LIVE" else "paper")
+        if config_manager.get("execution_mode") == "live":
+            await update.message.reply_text(
+                "Optional LIVE test trade (recommended):\n"
+                "I will attempt a tiny BUY+SELL cycle to verify the exchange API works.\n\n"
+                "Reply RUN_TEST or SKIP:",
+                reply_markup=ReplyKeyboardMarkup([["RUN_TEST", "SKIP"]], one_time_keyboard=True),
+            )
+            return TEST_TRADE
+
         await update.message.reply_text(
             "🔒 SAFETY CHECK: Your maximum trading capital is strictly limited to 100 USDC.\n"
             "Confirm strict 100 USDC limit?",
-            reply_markup=ReplyKeyboardMarkup([["Yes", "No"]], one_time_keyboard=True)
+            reply_markup=ReplyKeyboardMarkup([["Yes", "No"]], one_time_keyboard=True),
+        )
+        return CONFIRM_CAPITAL
+
+    async def test_trade_step(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        choice = update.message.text.strip().upper()
+        if choice == "RUN_TEST":
+            await update.message.reply_text("Running LIVE test trade... please wait.", reply_markup=ReplyKeyboardRemove())
+            loop = asyncio.get_running_loop()
+
+            # Re-init trader with provided exchange credentials
+            self.trader.initialize()
+            symbol = config_manager.get("symbol", "BTC/USDT")
+            result = await loop.run_in_executor(None, lambda: self.trader.run_test_trade(symbol=symbol, quote_amount=1.0))
+            await update.message.reply_text(result)
+
+        await update.message.reply_text(
+            "🔒 SAFETY CHECK: Your maximum trading capital is strictly limited to 100 USDC.\n"
+            "Confirm strict 100 USDC limit?",
+            reply_markup=ReplyKeyboardMarkup([["Yes", "No"]], one_time_keyboard=True),
         )
         return CONFIRM_CAPITAL
 

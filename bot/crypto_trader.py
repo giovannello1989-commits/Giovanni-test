@@ -43,6 +43,34 @@ class ExchangeClient:
                 self.exchange.set_sandbox_mode(True)
             except Exception as e:
                 logger.warning("Sandbox requested but not supported/failed: %s", e)
+        self._markets_loaded = False
+
+    def load_markets(self) -> None:
+        try:
+            self.exchange.load_markets()
+            self._markets_loaded = True
+        except Exception as e:
+            logger.warning("Failed to load markets: %s", e)
+
+    def get_market(self, symbol: str) -> dict | None:
+        if not self._markets_loaded:
+            self.load_markets()
+        try:
+            return self.exchange.market(symbol)
+        except Exception:
+            return None
+
+    def get_min_amount(self, symbol: str) -> float | None:
+        m = self.get_market(symbol)
+        if not m:
+            return None
+        try:
+            limits = m.get("limits") or {}
+            amount = limits.get("amount") or {}
+            v = amount.get("min")
+            return float(v) if v is not None else None
+        except Exception:
+            return None
 
     def get_ticker_price(self, symbol: str) -> float | None:
         try:
@@ -247,6 +275,38 @@ class TradingEngine:
                 return "Sell failed (API Error)"
         
         return "No action"
+
+    def run_test_trade(self, *, symbol: str, quote_amount: float = 1.0) -> str:
+        """
+        Executes a small buy+sell cycle (LIVE mode only) to verify credentials.
+        Safety:
+        - Will not run if execution_mode != 'live'
+        - Will not run if computed amount is below min amount
+        """
+        if not self.client:
+            return "Test trade: Not initialized"
+
+        if self.config.get("execution_mode", "paper") != "live":
+            return "Test trade: skipped (not in LIVE mode)"
+
+        price = self.client.get_ticker_price(symbol)
+        if not price:
+            return "Test trade: failed to fetch price"
+
+        amount = float(quote_amount) / float(price)
+        min_amount = self.client.get_min_amount(symbol)
+        if min_amount is not None and amount < min_amount:
+            return f"Test trade: cannot place tiny order. min_amount={min_amount}, computed_amount={amount}"
+
+        buy = self.client.place_market_order(symbol, "BUY", amount)
+        if not buy:
+            return "Test trade: BUY failed (check API permissions/balances)"
+
+        sell = self.client.place_market_order(symbol, "SELL", amount)
+        if not sell:
+            return "Test trade: BUY ok, SELL failed (position may be open!)"
+
+        return f"Test trade ok: BUY+SELL amount={amount} {symbol} @~{price}"
 
     def emergency_stop(self):
         """

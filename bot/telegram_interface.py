@@ -11,7 +11,7 @@ from .database import get_total_exposure, init_db, AuditLog
 logger = logging.getLogger(__name__)
 
 # States
-API_KEY, CONFIRM_CAPITAL, TRADING_STYLE, STOCK_ALERTS, STOCK_MARKET, AGGRESSIVENESS, CONFIRM_START = range(7)
+EXCHANGE_ID, API_KEY, API_SECRET, EXECUTION_MODE, CONFIRM_CAPITAL, STOCK_ALERTS, STOCK_MARKET, AGGRESSIVENESS, CONFIRM_START = range(9)
 
 class BotInterface:
     def __init__(self, token):
@@ -30,9 +30,11 @@ class BotInterface:
         conv_handler = ConversationHandler(
             entry_points=[CommandHandler("start", self.start_wizard)],
             states={
+                EXCHANGE_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.receive_exchange_id)],
                 API_KEY: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.receive_api_key)],
+                API_SECRET: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.receive_api_secret)],
+                EXECUTION_MODE: [MessageHandler(filters.Regex("^(PAPER|LIVE)$"), self.receive_execution_mode)],
                 CONFIRM_CAPITAL: [MessageHandler(filters.Regex("^(Yes|No)$"), self.confirm_capital)],
-                TRADING_STYLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.choose_trading_style)],
                 STOCK_ALERTS: [MessageHandler(filters.Regex("^(Yes|No)$"), self.ask_stock_alerts)],
                 STOCK_MARKET: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.choose_stock_market)],
                 AGGRESSIVENESS: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.choose_aggressiveness)],
@@ -61,25 +63,56 @@ class BotInterface:
         await update.message.reply_text(
             "👋 Welcome to your Automated Trading Bot!\n\n"
             "I will guide you through the setup. NO technical knowledge required.\n\n"
-            "First, please enter your Revolut X API Key:",
+            "First, choose your exchange (ccxt id).\n"
+            "Examples: kraken, binance, coinbase, okx\n\n"
+            "Reply with the exchange id (default: kraken):",
+            reply_markup=ReplyKeyboardRemove()
+        )
+        return EXCHANGE_ID
+
+    async def receive_exchange_id(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        exchange_id = update.message.text.strip().lower() or "kraken"
+        config_manager.set("exchange_id", exchange_id)
+        await update.message.reply_text(
+            "Now enter your Exchange API Key.\n\n"
+            "If you only want REAL market data but NO live trading, you can send '-' to skip.",
             reply_markup=ReplyKeyboardRemove()
         )
         return API_KEY
 
     async def receive_api_key(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        api_key = update.message.text
-        # Basic validation
-        if len(api_key) < 10:
-            await update.message.reply_text("⚠️ That doesn't look like a valid API key. Please try again.")
-            return API_KEY
-        
-        context.user_data['api_key'] = api_key
-        config_manager.set("revolut_api_key", api_key)
+        api_key = update.message.text.strip()
+        if api_key == "-":
+            api_key = ""
+        config_manager.set("exchange_api_key", api_key)
         
         await update.message.reply_text(
-            "✅ API Key accepted.\n\n"
+            "Now enter your Exchange API Secret.\n\n"
+            "If you skipped the key, send '-' to skip.",
+            reply_markup=ReplyKeyboardRemove()
+        )
+        return API_SECRET
+
+    async def receive_api_secret(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        api_secret = update.message.text.strip()
+        if api_secret == "-":
+            api_secret = ""
+        config_manager.set("exchange_api_secret", api_secret)
+
+        await update.message.reply_text(
+            "Choose execution mode:\n"
+            "- PAPER: logs + DB only (no real orders)\n"
+            "- LIVE: sends real market orders via the exchange API\n\n"
+            "Reply with PAPER or LIVE:",
+            reply_markup=ReplyKeyboardMarkup([["PAPER", "LIVE"]], one_time_keyboard=True)
+        )
+        return EXECUTION_MODE
+
+    async def receive_execution_mode(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        mode = update.message.text.strip().upper()
+        config_manager.set("execution_mode", "live" if mode == "LIVE" else "paper")
+        await update.message.reply_text(
             "🔒 SAFETY CHECK: Your maximum trading capital is strictly limited to 100 USDC.\n"
-            "This limit allows you to trade safely without risking too much.\n\n"
             "Confirm strict 100 USDC limit?",
             reply_markup=ReplyKeyboardMarkup([["Yes", "No"]], one_time_keyboard=True)
         )
@@ -91,20 +124,6 @@ class BotInterface:
             return ConversationHandler.END
         
         config_manager.set("max_capital", 100.0)
-        
-        styles = [["Daily momentum"], ["Intraday pump"], ["Short-term trend"], ["Test / paper mode"]]
-        await update.message.reply_text(
-            "Choose your trading style:",
-            reply_markup=ReplyKeyboardMarkup(styles, one_time_keyboard=True)
-        )
-        return TRADING_STYLE
-
-    async def choose_trading_style(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        style = update.message.text
-        if style == "Test / paper mode":
-            config_manager.set("trading_style", "test_mode")
-        else:
-            config_manager.set("trading_style", "momentum") # Simplify for now
         
         await update.message.reply_text(
             "Do you want Stock Market (Fiat) Alerts? (No automated trading, just alerts)",
@@ -147,7 +166,9 @@ class BotInterface:
         
         summary = (
             "✅ SETUP COMPLETE\n\n"
-            f"🔹 Mode: {config_manager.get('trading_style')}\n"
+            f"🔹 Exchange: {config_manager.get('exchange_id')}\n"
+            f"🔹 Exec Mode: {config_manager.get('execution_mode')}\n"
+            f"🔹 Symbol: {config_manager.get('symbol')}\n"
             f"🔹 Max Capital: 100 USDC\n"
             f"🔹 Stock Alerts: {config_manager.get('stock_alerts_enabled')}\n"
             f"🔹 Static IP: {ip}\n\n"
@@ -185,7 +206,8 @@ class BotInterface:
         chat_id = config_manager.get("admin_chat_id")
         if chat_id:
             # Pass chat_id to the callback via context if needed, or just access config in callback
-            self.job_queue.run_repeating(self.trade_job, interval=60*15, first=10, chat_id=chat_id) # Every 15 mins
+            interval = int(config_manager.get("trade_interval_seconds", 60))
+            self.job_queue.run_repeating(self.trade_job, interval=interval, first=10, chat_id=chat_id)
             
             if config_manager.get("stock_alerts_enabled"):
                 self.job_queue.run_repeating(self.stock_job, interval=60*60, first=20, chat_id=chat_id) # Every hour
@@ -214,7 +236,20 @@ class BotInterface:
     async def status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         status = "RUNNING" if self.trader.is_running else "PAUSED"
         ip = config_manager.get("static_ip")
-        await update.message.reply_text(f"Status: {status}\nIP: {ip}")
+        symbol = config_manager.get("symbol", "BTC/USDT")
+        exchange_id = config_manager.get("exchange_id", "kraken")
+        mode = config_manager.get("execution_mode", "paper")
+        price = self.trader.last_price
+        ts = self.trader.last_price_ts
+        await update.message.reply_text(
+            f"Status: {status}\n"
+            f"Exchange: {exchange_id}\n"
+            f"Mode: {mode}\n"
+            f"Symbol: {symbol}\n"
+            f"Last price: {price}\n"
+            f"Last price ts: {ts}\n"
+            f"IP: {ip}"
+        )
 
     async def balance(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         exposure = get_total_exposure()

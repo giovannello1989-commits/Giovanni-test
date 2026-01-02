@@ -5,13 +5,37 @@ from typing import Dict, Any
 CONFIG_FILE = "user_config.json"
 
 DEFAULT_CONFIG = {
-    "revolut_api_key": "",
-    "revolut_api_secret": "",  # If needed, usually just one key for some APIs
+    # Exchange integration (ccxt)
+    # Use public endpoints for market data if api_key/secret are empty.
+    "exchange_id": "kraken",          # e.g. kraken, binance, coinbase, okx...
+    "exchange_api_key": "",
+    "exchange_api_secret": "",
+    "sandbox_mode": False,
+    "execution_mode": "paper",        # paper | live
+
+    # Trading settings
+    "symbol": "BTC/USDT",
     "max_capital": 100.0,
-    "trading_style": "test_mode",
+    "bet_usd": 20.0,
+    "trade_interval_seconds": 60,
+
+    # Strategy (RSI)
+    "timeframe": "1m",
+    "ohlcv_limit": 200,
+    "rsi_period": 14,
+    "rsi_buy_threshold": 30.0,
+    "rsi_sell_threshold": 70.0,
+
+    # Optional legacy key (kept to avoid breaking existing configs)
+    "revolut_api_key": "",
+    "revolut_api_secret": "",
+
+    # Stock alerts (separate feature)
     "stock_alerts_enabled": False,
     "stock_market": "US",
     "alert_aggressiveness": "medium",
+
+    # Ops
     "static_ip": None,
     "is_configured": False
 }

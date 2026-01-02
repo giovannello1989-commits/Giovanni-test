@@ -32,8 +32,9 @@ class AuditLog(BaseModel):
     capital_exposure = FloatField()
 
 def init_db():
-    db.connect()
-    db.create_tables([Position, Trade, AuditLog])
+    if db.is_closed():
+        db.connect(reuse_if_open=True)
+    db.create_tables([Position, Trade, AuditLog], safe=True)
 
 def get_total_exposure():
     # Calculate total cost basis of all open positions

@@ -125,17 +125,17 @@ class TradingEngine:
         RSI-based strategy using real OHLCV data from the exchange.
         """
         if not self.client:
-            return "HOLD", None
+            return "HOLD"
 
         timeframe = self.config.get("timeframe", "1m")
         limit = int(self.config.get("ohlcv_limit", 200))
         df = self.client.fetch_ohlcv_df(symbol, timeframe=timeframe, limit=limit)
         if df is None or df.empty:
-            return "HOLD", None
+            return "HOLD"
 
         rsi = self._rsi(df["close"], period=int(self.config.get("rsi_period", 14)))
         if rsi is None:
-            return "HOLD", None
+            return "HOLD"
 
         buy_th = float(self.config.get("rsi_buy_threshold", 30.0))
         sell_th = float(self.config.get("rsi_sell_threshold", 70.0))

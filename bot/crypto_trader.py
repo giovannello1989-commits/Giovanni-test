@@ -102,27 +102,20 @@ class TradingEngine:
             return False
         return True
 
-    def _rsi(self, closes: pd.Series, period: int = 14) -> float | None:
-        if closes is None or len(closes) < period + 2:
+    def _pct_change(self, closes: pd.Series, lookback_bars: int) -> float | None:
+        if closes is None or len(closes) < lookback_bars + 1:
             return None
+        last = float(closes.iloc[-1])
+        prev = float(closes.iloc[-(lookback_bars + 1)])
+        if prev == 0:
+            return None
+        return ((last - prev) / prev) * 100.0
 
-        delta = closes.diff()
-        gain = delta.where(delta > 0, 0.0)
-        loss = (-delta.where(delta < 0, 0.0))
-
-        # Wilder's smoothing (EMA with alpha=1/period) is common for RSI;
-        # ewm gives stable results and avoids the "all nan" early window issue.
-        avg_gain = gain.ewm(alpha=1 / period, adjust=False).mean()
-        avg_loss = loss.ewm(alpha=1 / period, adjust=False).mean()
-
-        rs = avg_gain / avg_loss.replace(0, np.nan)
-        rsi = 100 - (100 / (1 + rs))
-        val = rsi.iloc[-1]
-        return float(val) if pd.notna(val) else None
-
-    def analyze_market(self, symbol: str):
+    def analyze_market(self, symbol: str, *, has_open_position: bool):
         """
-        RSI-based strategy using real OHLCV data from the exchange.
+        Short-term momentum:
+        - BUY when price rises fast over a short window
+        - SELL when price starts falling OR breaks trailing stop from recent peak
         """
         if not self.client:
             return "HOLD"
@@ -133,17 +126,36 @@ class TradingEngine:
         if df is None or df.empty:
             return "HOLD"
 
-        rsi = self._rsi(df["close"], period=int(self.config.get("rsi_period", 14)))
-        if rsi is None:
+        closes = df["close"].dropna()
+        lookback = int(self.config.get("crypto_lookback_bars", 5))
+        change_pct = self._pct_change(closes, lookback_bars=lookback)
+        if change_pct is None:
             return "HOLD"
 
-        buy_th = float(self.config.get("rsi_buy_threshold", 30.0))
-        sell_th = float(self.config.get("rsi_sell_threshold", 70.0))
+        rise_th = float(self.config.get("crypto_rise_threshold_pct", 0.25))
+        fall_th = float(self.config.get("crypto_fall_threshold_pct", 0.25))
 
-        if rsi <= buy_th:
-            return "BUY"
-        if rsi >= sell_th:
+        # If we don't have a position, only consider BUY.
+        if not has_open_position:
+            if change_pct >= rise_th:
+                return "BUY"
+            return "HOLD"
+
+        # If we have a position, only consider SELL.
+        if change_pct <= -abs(fall_th):
             return "SELL"
+
+        trailing_window = int(self.config.get("crypto_trailing_window_bars", 30))
+        trailing_stop_pct = float(self.config.get("crypto_trailing_stop_pct", 0.30))
+        if len(closes) >= trailing_window:
+            window = closes.iloc[-trailing_window:]
+            peak = float(window.max())
+            last = float(window.iloc[-1])
+            if peak > 0:
+                drawdown_pct = ((peak - last) / peak) * 100.0
+                if drawdown_pct >= abs(trailing_stop_pct):
+                    return "SELL"
+
         return "HOLD"
 
     def execute_trade_cycle(self):
@@ -160,10 +172,15 @@ class TradingEngine:
 
         self.last_price = float(price)
         self.last_price_ts = pd.Timestamp.utcnow().isoformat()
-            
-        signal = self.analyze_market(symbol)
+
+        open_positions = Position.select().where(Position.symbol == symbol, Position.is_open == True)
+        has_open_position = open_positions.exists()
+
+        signal = self.analyze_market(symbol, has_open_position=has_open_position)
 
         if signal == "BUY":
+            if has_open_position:
+                return "No action"
             # Buy logic
             amount_to_invest = float(self.config.get("bet_usd", 20.0))  # Fixed bet size in quote currency
             quantity = amount_to_invest / price
@@ -199,7 +216,7 @@ class TradingEngine:
 
         elif signal == "SELL":
             # Sell logic - sell all open positions
-            positions = Position.select().where(Position.symbol == symbol, Position.is_open == True)
+            positions = open_positions
             total_qty = sum([p.quantity for p in positions])
             
             if total_qty > 0:

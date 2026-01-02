@@ -1,12 +1,14 @@
 import logging
 import asyncio
+import datetime
 from telegram import Update, ReplyKeyboardMarkup, ReplyKeyboardRemove
 from telegram.ext import Application, CommandHandler, ContextTypes, ConversationHandler, MessageHandler, filters
 from .config import config_manager
 from .crypto_trader import TradingEngine
 from .stock_monitor import StockMonitor
+from .forex_monitor import ForexMonitor
 from .cloud_manager import CloudManager
-from .database import get_total_exposure, init_db, AuditLog
+from .database import get_total_exposure, init_db, AuditLog, ForexWatch, ForexHolding
 
 logger = logging.getLogger(__name__)
 
@@ -18,6 +20,7 @@ class BotInterface:
         self.application = Application.builder().token(token).build()
         self.trader = TradingEngine(config_manager)
         self.stock_monitor = StockMonitor(config_manager)
+        self.forex_monitor = ForexMonitor(config_manager)
         self.cloud_manager = CloudManager()
         
         # Initialize DB
@@ -49,6 +52,14 @@ class BotInterface:
         self.application.add_handler(CommandHandler("emergency_stop", self.emergency_stop))
         self.application.add_handler(CommandHandler("resume", self.resume))
         self.application.add_handler(CommandHandler("logs", self.logs))
+
+        # Forex alerts (manual trading)
+        self.application.add_handler(CommandHandler("forex_watch", self.forex_watch))
+        self.application.add_handler(CommandHandler("forex_unwatch", self.forex_unwatch))
+        self.application.add_handler(CommandHandler("forex_list", self.forex_list))
+        self.application.add_handler(CommandHandler("forex_buy", self.forex_buy))
+        self.application.add_handler(CommandHandler("forex_sell", self.forex_sell))
+        self.application.add_handler(CommandHandler("forex_positions", self.forex_positions))
 
         # Job Queue
         self.job_queue = self.application.job_queue
@@ -212,6 +223,10 @@ class BotInterface:
             if config_manager.get("stock_alerts_enabled"):
                 self.job_queue.run_repeating(self.stock_job, interval=60*60, first=20, chat_id=chat_id) # Every hour
 
+            if config_manager.get("forex_alerts_enabled", True):
+                fx_interval = int(config_manager.get("forex_poll_interval_seconds", 60))
+                self.job_queue.run_repeating(self.forex_job, interval=fx_interval, first=15, chat_id=chat_id)
+
     async def trade_job(self, context: ContextTypes.DEFAULT_TYPE):
         if not self.trader.is_running:
             return
@@ -232,6 +247,71 @@ class BotInterface:
         
         if msg:
              await context.bot.send_message(chat_id=context.job.chat_id, text=msg)
+
+    async def forex_job(self, context: ContextTypes.DEFAULT_TYPE):
+        """
+        1) If a watched forex symbol is rising fast -> alert to consider buying.
+        2) If user marked a symbol as bought and it starts falling -> alert to consider selling.
+        """
+        if not config_manager.get("forex_alerts_enabled", True):
+            return
+
+        watches = list(ForexWatch.select().where(ForexWatch.is_active == True))
+        if not watches:
+            return
+
+        cooldown_seconds = 10 * 60
+        now = datetime.datetime.utcnow()
+
+        for w in watches:
+            signal = self.forex_monitor.detect_signal(
+                w.symbol,
+                lookback_bars=w.lookback_bars,
+                rise_threshold_pct=w.rise_threshold_pct,
+                fall_threshold_pct=w.fall_threshold_pct,
+                interval=w.interval,
+            )
+            if not signal:
+                continue
+
+            # Rising: notify to consider buy
+            if signal.direction == "RISE":
+                if w.last_rise_alert_at and (now - w.last_rise_alert_at).total_seconds() < cooldown_seconds:
+                    continue
+                w.last_rise_alert_at = now
+                w.save()
+                await context.bot.send_message(
+                    chat_id=context.job.chat_id,
+                    text=(
+                        f"📈 FOREX RISING ({w.symbol})\n"
+                        f"Price: {signal.last}\n"
+                        f"Move({w.lookback_bars} bars): +{signal.change_pct:.4f}%\n\n"
+                        f"If you buy, tell me with:\n/forex_buy {w.symbol}"
+                    ),
+                )
+                continue
+
+            # Falling: only notify if the user said they're in a position
+            holding = (
+                ForexHolding.select()
+                .where(ForexHolding.symbol == w.symbol, ForexHolding.is_open == True)
+                .order_by(ForexHolding.bought_at.desc())
+                .first()
+            )
+            if holding:
+                if w.last_fall_alert_at and (now - w.last_fall_alert_at).total_seconds() < cooldown_seconds:
+                    continue
+                w.last_fall_alert_at = now
+                w.save()
+                await context.bot.send_message(
+                    chat_id=context.job.chat_id,
+                    text=(
+                        f"📉 FOREX FALLING ({w.symbol})\n"
+                        f"Price: {signal.last}\n"
+                        f"Move({w.lookback_bars} bars): {signal.change_pct:.4f}%\n\n"
+                        f"If you sell, tell me with:\n/forex_sell {w.symbol}"
+                    ),
+                )
 
     async def status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         status = "RUNNING" if self.trader.is_running else "PAUSED"
@@ -273,6 +353,86 @@ class BotInterface:
         msg = "📋 **Recent Logs:**\n\n"
         for l in logs:
             msg += f"{l.timestamp}: {l.action} - {l.details}\n"
+        await update.message.reply_text(msg)
+
+    async def forex_watch(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """
+        Usage: /forex_watch EURUSD=X [lookback_bars] [rise_pct] [fall_pct]
+        """
+        if not context.args:
+            await update.message.reply_text("Usage: /forex_watch EURUSD=X [lookback_bars] [rise_pct] [fall_pct]")
+            return
+
+        symbol = context.args[0].strip()
+        lookback = int(context.args[1]) if len(context.args) >= 2 else int(config_manager.get("forex_default_lookback_bars", 5))
+        rise = float(context.args[2]) if len(context.args) >= 3 else float(config_manager.get("forex_default_rise_threshold_pct", 0.05))
+        fall = float(context.args[3]) if len(context.args) >= 4 else float(config_manager.get("forex_default_fall_threshold_pct", 0.05))
+        interval = str(config_manager.get("forex_default_interval", "1m"))
+
+        obj, created = ForexWatch.get_or_create(symbol=symbol, defaults={
+            "lookback_bars": lookback,
+            "rise_threshold_pct": rise,
+            "fall_threshold_pct": fall,
+            "interval": interval,
+            "is_active": True,
+        })
+        if not created:
+            obj.lookback_bars = lookback
+            obj.rise_threshold_pct = rise
+            obj.fall_threshold_pct = fall
+            obj.interval = interval
+            obj.is_active = True
+            obj.save()
+
+        await update.message.reply_text(
+            f"✅ Watching {symbol}\nlookback={lookback} bars, rise={rise}%, fall={fall}%, interval={interval}"
+        )
+
+    async def forex_unwatch(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not context.args:
+            await update.message.reply_text("Usage: /forex_unwatch EURUSD=X")
+            return
+        symbol = context.args[0].strip()
+        q = ForexWatch.update(is_active=False).where(ForexWatch.symbol == symbol)
+        q.execute()
+        await update.message.reply_text(f"🛑 Unwatched {symbol}")
+
+    async def forex_list(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        watches = list(ForexWatch.select().where(ForexWatch.is_active == True))
+        if not watches:
+            await update.message.reply_text("No active forex watches. Add one with /forex_watch EURUSD=X")
+            return
+        msg = "👀 Active forex watches:\n\n"
+        for w in watches:
+            msg += f"- {w.symbol} (lookback={w.lookback_bars}, rise={w.rise_threshold_pct}%, fall={w.fall_threshold_pct}%, interval={w.interval})\n"
+        await update.message.reply_text(msg)
+
+    async def forex_buy(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not context.args:
+            await update.message.reply_text("Usage: /forex_buy EURUSD=X")
+            return
+        symbol = context.args[0].strip()
+        last = self.forex_monitor.get_last_price(symbol, interval=str(config_manager.get("forex_default_interval", "1m")))
+        ForexHolding.create(symbol=symbol, is_open=True, bought_price=last)
+        await update.message.reply_text(f"✅ Marked as BOUGHT: {symbol}. I will alert you when it starts falling.")
+
+    async def forex_sell(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not context.args:
+            await update.message.reply_text("Usage: /forex_sell EURUSD=X")
+            return
+        symbol = context.args[0].strip()
+        q = ForexHolding.update(is_open=False).where(ForexHolding.symbol == symbol, ForexHolding.is_open == True)
+        q.execute()
+        await update.message.reply_text(f"✅ Marked as SOLD: {symbol}.")
+
+    async def forex_positions(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        holdings = list(ForexHolding.select().where(ForexHolding.is_open == True).order_by(ForexHolding.bought_at.desc()))
+        if not holdings:
+            await update.message.reply_text("No open forex positions marked. Use /forex_buy EURUSD=X")
+            return
+        msg = "💼 Open forex positions (manual):\n\n"
+        for h in holdings:
+            msg += f"- {h.symbol} (since {h.bought_at})\n"
         await update.message.reply_text(msg)
 
     def run(self):

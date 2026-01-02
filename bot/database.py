@@ -31,10 +31,33 @@ class AuditLog(BaseModel):
     details = TextField()
     capital_exposure = FloatField()
 
+class ForexWatch(BaseModel):
+    """
+    Symbols like 'EURUSD=X' (yfinance).
+    """
+    symbol = CharField(unique=True)
+    lookback_bars = IntegerField(default=5)
+    rise_threshold_pct = FloatField(default=0.05)
+    fall_threshold_pct = FloatField(default=0.05)
+    interval = CharField(default="1m")
+    is_active = BooleanField(default=True)
+    last_rise_alert_at = DateTimeField(null=True)
+    last_fall_alert_at = DateTimeField(null=True)
+
+class ForexHolding(BaseModel):
+    """
+    Manual holding the user tells us about via Telegram.
+    We only alert; we do not trade forex.
+    """
+    symbol = CharField()
+    is_open = BooleanField(default=True)
+    bought_at = DateTimeField(default=datetime.datetime.now)
+    bought_price = FloatField(null=True)
+
 def init_db():
     if db.is_closed():
         db.connect(reuse_if_open=True)
-    db.create_tables([Position, Trade, AuditLog], safe=True)
+    db.create_tables([Position, Trade, AuditLog, ForexWatch, ForexHolding], safe=True)
 
 def get_total_exposure():
     # Calculate total cost basis of all open positions

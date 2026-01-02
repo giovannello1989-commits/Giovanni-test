@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# local runtime state / secrets
+secrets.json
+user_config.json
+trading_bot.db
+
+# editor / OS
+.DS_Store

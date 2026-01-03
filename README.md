@@ -30,6 +30,19 @@ A fully automated trading bot controlled via Telegram.
    python3 -m bot.main
    ```
 
+## Local Web Dashboard (no Telegram required)
+
+Run a local UI (HTML+CSS) at `http://127.0.0.1:8080`:
+
+```bash
+python3 -m bot.local_web
+```
+
+From the dashboard you can:
+- start/stop the trading loop
+- run one trade cycle manually
+- edit config locally (Revolut X API key, symbol, interval, etc.)
+
 4. **Telegram Setup**:
    - Open your bot in Telegram.
    - Send `/start`.

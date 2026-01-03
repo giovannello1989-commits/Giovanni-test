@@ -15,6 +15,8 @@ DEFAULT_CONFIG = {
     "revolutx_api_key": "",
     # PEM text stored locally (NOT committed; user_config.json is gitignored)
     "revolutx_private_key_pem": "",
+    # Optional: read PEM from local file instead of Telegram
+    "revolutx_private_key_path": "private.pem",
     "revolutx_base_url": "https://api.revolutx.com",
 
     # ccxt (fallback/dev)

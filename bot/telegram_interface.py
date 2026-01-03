@@ -89,15 +89,17 @@ class BotInterface:
         api_key = update.message.text.strip()
         config_manager.set("revolutx_api_key", api_key)
         await update.message.reply_text(
-            "Now paste your Ed25519 private key PEM (private.pem) used for signing.\n\n"
-            "Tip: send the whole PEM including -----BEGIN/END----- lines.",
+            "Private key (Ed25519) for signing:\n\n"
+            "- Recommended: save it as a local file named 'private.pem' next to the project, then reply '-' here.\n"
+            "- Or (less safe): paste the PEM content here (including -----BEGIN/END----- lines).",
             reply_markup=ReplyKeyboardRemove(),
         )
         return REVX_PRIVATE_KEY
 
     async def receive_revolutx_private_key(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         pem = update.message.text.strip()
-        config_manager.set("revolutx_private_key_pem", pem)
+        if pem != "-":
+            config_manager.set("revolutx_private_key_pem", pem)
 
         await update.message.reply_text(
             "I will now run a LIVE connectivity test: BUY+SELL (~1 USDC) to verify the API works.\n"

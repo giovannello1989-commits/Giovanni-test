@@ -1,5 +1,6 @@
 import logging
 import time
+import os
 import pandas as pd
 import numpy as np
 from .database import Position, Trade, AuditLog, get_total_exposure, db
@@ -119,8 +120,19 @@ class TradingEngine:
     def initialize(self):
         exchange_id = self.config.get("exchange_id", "kraken")
         if exchange_id == "revolutx":
-            api_key = self.config.get("revolutx_api_key")
-            pem = self.config.get("revolutx_private_key_pem")
+            # Prefer env vars (safe), then user_config.json, then local file.
+            api_key = os.environ.get("REVX_API_KEY") or self.config.get("revolutx_api_key")
+
+            pem = os.environ.get("REVX_PRIVATE_KEY_PEM") or self.config.get("revolutx_private_key_pem")
+            if not pem:
+                pem_path = os.environ.get("REVX_PRIVATE_KEY_PATH") or self.config.get("revolutx_private_key_path", "private.pem")
+                try:
+                    if pem_path and os.path.exists(pem_path):
+                        with open(pem_path, "r", encoding="utf-8") as f:
+                            pem = f.read()
+                except Exception as e:
+                    logger.error("Failed reading revolutx private key file %s: %s", pem_path, e)
+
             base_url = self.config.get("revolutx_base_url", "https://api.revolutx.com")
             self.client = RevolutXClient(RevolutXConfig(api_key=api_key, private_key_pem=pem, base_url=base_url))
         else:

@@ -3,6 +3,7 @@ import time
 import pandas as pd
 import numpy as np
 from .database import Position, Trade, AuditLog, get_total_exposure, db
+from .revolutx_client import RevolutXClient, RevolutXConfig
 
 logger = logging.getLogger(__name__)
 
@@ -108,20 +109,27 @@ class ExchangeClient:
 class TradingEngine:
     def __init__(self, config_manager):
         self.config = config_manager
-        self.client: ExchangeClient | None = None
+        self.client: object | None = None
         self.is_running = False
         self.max_capital = 100.0
         self.last_price: float | None = None
         self.last_price_ts: str | None = None
+        self._price_history: dict[str, list[float]] = {}
         
     def initialize(self):
         exchange_id = self.config.get("exchange_id", "kraken")
-        api_key = self.config.get("exchange_api_key")
-        api_secret = self.config.get("exchange_api_secret")
-        sandbox = bool(self.config.get("sandbox_mode", False))
-        self.client = ExchangeClient(exchange_id, api_key, api_secret, sandbox=sandbox)
+        if exchange_id == "revolutx":
+            api_key = self.config.get("revolutx_api_key")
+            pem = self.config.get("revolutx_private_key_pem")
+            base_url = self.config.get("revolutx_base_url", "https://api.revolutx.com")
+            self.client = RevolutXClient(RevolutXConfig(api_key=api_key, private_key_pem=pem, base_url=base_url))
+        else:
+            api_key = self.config.get("exchange_api_key")
+            api_secret = self.config.get("exchange_api_secret")
+            sandbox = bool(self.config.get("sandbox_mode", False))
+            self.client = ExchangeClient(exchange_id, api_key, api_secret, sandbox=sandbox)
         self.max_capital = self.config.get("max_capital", 100.0)
-        logger.info("Trading Engine Initialized. Exchange=%s sandbox=%s", exchange_id, sandbox)
+        logger.info("Trading Engine Initialized. Exchange=%s", exchange_id)
 
     def check_exposure_limit(self, potential_cost):
         current_exposure = get_total_exposure()
@@ -148,13 +156,22 @@ class TradingEngine:
         if not self.client:
             return "HOLD"
 
-        timeframe = self.config.get("timeframe", "1m")
-        limit = int(self.config.get("ohlcv_limit", 200))
-        df = self.client.fetch_ohlcv_df(symbol, timeframe=timeframe, limit=limit)
-        if df is None or df.empty:
-            return "HOLD"
+        # Prefer OHLCV if available (ccxt). For Revolut X we fall back to local ticker history.
+        closes = None
+        if hasattr(self.client, "fetch_ohlcv_df"):
+            timeframe = self.config.get("timeframe", "1m")
+            limit = int(self.config.get("ohlcv_limit", 200))
+            df = getattr(self.client, "fetch_ohlcv_df")(symbol, timeframe=timeframe, limit=limit)
+            if df is None or df.empty:
+                return "HOLD"
+            closes = df["close"].dropna()
+        else:
+            hist = self._price_history.get(symbol, [])
+            if len(hist) < int(self.config.get("crypto_trailing_window_bars", 30)):
+                # not enough local history yet
+                return "HOLD"
+            closes = pd.Series(hist)
 
-        closes = df["close"].dropna()
         lookback = int(self.config.get("crypto_lookback_bars", 5))
         change_pct = self._pct_change(closes, lookback_bars=lookback)
         if change_pct is None:
@@ -193,13 +210,24 @@ class TradingEngine:
         symbol = self.config.get("symbol", "BTC/USDT")
         
         # Get price first (fresh market data)
-        price = self.client.get_ticker_price(symbol)
+        price = None
+        if hasattr(self.client, "get_ticker_price"):
+            price = getattr(self.client, "get_ticker_price")(symbol)
+        elif hasattr(self.client, "get_last_price"):
+            price = getattr(self.client, "get_last_price")(symbol)
         
         if not price:
             return "Error fetching price (Check logs)"
 
         self.last_price = float(price)
         self.last_price_ts = pd.Timestamp.utcnow().isoformat()
+
+        # Maintain local ticker history for exchanges without OHLCV
+        hist = self._price_history.setdefault(symbol, [])
+        hist.append(float(price))
+        max_keep = max(int(self.config.get("ohlcv_limit", 200)), int(self.config.get("crypto_trailing_window_bars", 30)) + 5)
+        if len(hist) > max_keep:
+            del hist[: len(hist) - max_keep]
 
         open_positions = Position.select().where(Position.symbol == symbol, Position.is_open == True)
         has_open_position = open_positions.exists()
@@ -217,7 +245,10 @@ class TradingEngine:
                 execution_mode = self.config.get("execution_mode", "paper")  # paper | live
                 order = None
                 if execution_mode == "live":
-                    order = self.client.place_market_order(symbol, "BUY", float(quantity))
+                    if hasattr(self.client, "place_market_order"):
+                        order = getattr(self.client, "place_market_order")(symbol, "BUY", float(quantity))
+                    elif hasattr(self.client, "create_market_order"):
+                        order = getattr(self.client, "create_market_order")(symbol=symbol, side="BUY", quantity=str(quantity))
 
                 if execution_mode == "paper" or order:
                     Trade.create(
@@ -251,7 +282,10 @@ class TradingEngine:
                 execution_mode = self.config.get("execution_mode", "paper")
                 order = None
                 if execution_mode == "live":
-                    order = self.client.place_market_order(symbol, "SELL", float(total_qty))
+                    if hasattr(self.client, "place_market_order"):
+                        order = getattr(self.client, "place_market_order")(symbol, "SELL", float(total_qty))
+                    elif hasattr(self.client, "create_market_order"):
+                        order = getattr(self.client, "create_market_order")(symbol=symbol, side="SELL", quantity=str(total_qty))
 
                 if execution_mode == "paper" or order:
                     Trade.create(
@@ -289,20 +323,34 @@ class TradingEngine:
         if self.config.get("execution_mode", "paper") != "live":
             return "Test trade: skipped (not in LIVE mode)"
 
-        price = self.client.get_ticker_price(symbol)
+        price = None
+        if hasattr(self.client, "get_ticker_price"):
+            price = getattr(self.client, "get_ticker_price")(symbol)
+        elif hasattr(self.client, "get_last_price"):
+            price = getattr(self.client, "get_last_price")(symbol)
         if not price:
             return "Test trade: failed to fetch price"
 
         amount = float(quote_amount) / float(price)
-        min_amount = self.client.get_min_amount(symbol)
-        if min_amount is not None and amount < min_amount:
-            return f"Test trade: cannot place tiny order. min_amount={min_amount}, computed_amount={amount}"
+        min_amount = None
+        if hasattr(self.client, "get_min_amount"):
+            min_amount = getattr(self.client, "get_min_amount")(symbol)
+            if min_amount is not None and amount < min_amount:
+                return f"Test trade: cannot place tiny order. min_amount={min_amount}, computed_amount={amount}"
 
-        buy = self.client.place_market_order(symbol, "BUY", amount)
+        buy = None
+        if hasattr(self.client, "place_market_order"):
+            buy = getattr(self.client, "place_market_order")(symbol, "BUY", amount)
+        elif hasattr(self.client, "create_market_order"):
+            buy = getattr(self.client, "create_market_order")(symbol=symbol, side="BUY", quantity=str(amount))
         if not buy:
             return "Test trade: BUY failed (check API permissions/balances)"
 
-        sell = self.client.place_market_order(symbol, "SELL", amount)
+        sell = None
+        if hasattr(self.client, "place_market_order"):
+            sell = getattr(self.client, "place_market_order")(symbol, "SELL", amount)
+        elif hasattr(self.client, "create_market_order"):
+            sell = getattr(self.client, "create_market_order")(symbol=symbol, side="SELL", quantity=str(amount))
         if not sell:
             return "Test trade: BUY ok, SELL failed (position may be open!)"
 

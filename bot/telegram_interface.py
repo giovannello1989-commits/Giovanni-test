@@ -12,8 +12,8 @@ from .database import get_total_exposure, init_db, AuditLog, ForexWatch, ForexHo
 
 logger = logging.getLogger(__name__)
 
-# States
-EXCHANGE_ID, API_KEY, API_SECRET, EXECUTION_MODE, TEST_TRADE, CONFIRM_CAPITAL, STOCK_ALERTS, STOCK_MARKET, AGGRESSIVENESS, CONFIRM_START = range(10)
+# States (simplified for Revolut X default)
+REVX_API_KEY, REVX_PRIVATE_KEY, TEST_TRADE, CONFIRM_CAPITAL, STOCK_ALERTS, STOCK_MARKET, AGGRESSIVENESS, CONFIRM_START = range(8)
 
 class BotInterface:
     def __init__(self, token):
@@ -33,10 +33,8 @@ class BotInterface:
         conv_handler = ConversationHandler(
             entry_points=[CommandHandler("start", self.start_wizard)],
             states={
-                EXCHANGE_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.receive_exchange_id)],
-                API_KEY: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.receive_api_key)],
-                API_SECRET: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.receive_api_secret)],
-                EXECUTION_MODE: [MessageHandler(filters.Regex("^(PAPER|LIVE)$"), self.receive_execution_mode)],
+                REVX_API_KEY: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.receive_revolutx_api_key)],
+                REVX_PRIVATE_KEY: [MessageHandler(filters.TEXT & ~filters.COMMAND, self.receive_revolutx_private_key)],
                 TEST_TRADE: [MessageHandler(filters.Regex("^(RUN_TEST|SKIP)$"), self.test_trade_step)],
                 CONFIRM_CAPITAL: [MessageHandler(filters.Regex("^(Yes|No)$"), self.confirm_capital)],
                 STOCK_ALERTS: [MessageHandler(filters.Regex("^(Yes|No)$"), self.ask_stock_alerts)],
@@ -73,73 +71,40 @@ class BotInterface:
         chat_id = update.effective_chat.id
         config_manager.set("admin_chat_id", chat_id)
         logger.info("Wizard started for chat_id=%s", chat_id)
+
+        # Default to Revolut X + LIVE
+        config_manager.set("exchange_id", "revolutx")
+        config_manager.set("execution_mode", "live")
+        config_manager.set("symbol", config_manager.get("symbol", "BTC_USDC"))
         
         await update.message.reply_text(
-            "👋 Welcome to your Automated Trading Bot!\n\n"
-            "I will guide you through the setup. NO technical knowledge required.\n\n"
-            "First, choose your exchange (ccxt id).\n"
-            "Examples: kraken, binance, coinbase, okx\n\n"
-            "Reply with the exchange id (default: kraken):",
+            "👋 Welcome!\n\n"
+            "Default exchange: Revolut X (LIVE).\n\n"
+            "Please enter your Revolut X API Key:",
             reply_markup=ReplyKeyboardRemove()
         )
-        return EXCHANGE_ID
+        return REVX_API_KEY
 
-    async def receive_exchange_id(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        exchange_id = update.message.text.strip().lower() or "kraken"
-        config_manager.set("exchange_id", exchange_id)
-        await update.message.reply_text(
-            "Now enter your Exchange API Key.\n\n"
-            "If you only want REAL market data but NO live trading, you can send '-' to skip.",
-            reply_markup=ReplyKeyboardRemove()
-        )
-        return API_KEY
-
-    async def receive_api_key(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    async def receive_revolutx_api_key(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         api_key = update.message.text.strip()
-        if api_key == "-":
-            api_key = ""
-        config_manager.set("exchange_api_key", api_key)
-        
+        config_manager.set("revolutx_api_key", api_key)
         await update.message.reply_text(
-            "Now enter your Exchange API Secret.\n\n"
-            "If you skipped the key, send '-' to skip.",
-            reply_markup=ReplyKeyboardRemove()
+            "Now paste your Ed25519 private key PEM (private.pem) used for signing.\n\n"
+            "Tip: send the whole PEM including -----BEGIN/END----- lines.",
+            reply_markup=ReplyKeyboardRemove(),
         )
-        return API_SECRET
+        return REVX_PRIVATE_KEY
 
-    async def receive_api_secret(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        api_secret = update.message.text.strip()
-        if api_secret == "-":
-            api_secret = ""
-        config_manager.set("exchange_api_secret", api_secret)
+    async def receive_revolutx_private_key(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        pem = update.message.text.strip()
+        config_manager.set("revolutx_private_key_pem", pem)
 
         await update.message.reply_text(
-            "Choose execution mode:\n"
-            "- PAPER: logs + DB only (no real orders)\n"
-            "- LIVE: sends real market orders via the exchange API\n\n"
-            "Reply with PAPER or LIVE:",
-            reply_markup=ReplyKeyboardMarkup([["PAPER", "LIVE"]], one_time_keyboard=True)
+            "I will now run a LIVE connectivity test: BUY+SELL (~1 USDC) to verify the API works.\n"
+            "Reply RUN_TEST (recommended) or SKIP:",
+            reply_markup=ReplyKeyboardMarkup([["RUN_TEST", "SKIP"]], one_time_keyboard=True),
         )
-        return EXECUTION_MODE
-
-    async def receive_execution_mode(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        mode = update.message.text.strip().upper()
-        config_manager.set("execution_mode", "live" if mode == "LIVE" else "paper")
-        if config_manager.get("execution_mode") == "live":
-            await update.message.reply_text(
-                "Optional LIVE test trade (recommended):\n"
-                "I will attempt a tiny BUY+SELL cycle to verify the exchange API works.\n\n"
-                "Reply RUN_TEST or SKIP:",
-                reply_markup=ReplyKeyboardMarkup([["RUN_TEST", "SKIP"]], one_time_keyboard=True),
-            )
-            return TEST_TRADE
-
-        await update.message.reply_text(
-            "🔒 SAFETY CHECK: Your maximum trading capital is strictly limited to 100 USDC.\n"
-            "Confirm strict 100 USDC limit?",
-            reply_markup=ReplyKeyboardMarkup([["Yes", "No"]], one_time_keyboard=True),
-        )
-        return CONFIRM_CAPITAL
+        return TEST_TRADE
 
     async def test_trade_step(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         choice = update.message.text.strip().upper()
@@ -147,9 +112,9 @@ class BotInterface:
             await update.message.reply_text("Running LIVE test trade... please wait.", reply_markup=ReplyKeyboardRemove())
             loop = asyncio.get_running_loop()
 
-            # Re-init trader with provided exchange credentials
+            # Re-init trader with provided Revolut X credentials
             self.trader.initialize()
-            symbol = config_manager.get("symbol", "BTC/USDT")
+            symbol = config_manager.get("symbol", "BTC_USDC")
             result = await loop.run_in_executor(None, lambda: self.trader.run_test_trade(symbol=symbol, quote_amount=1.0))
             await update.message.reply_text(result)
 
@@ -208,8 +173,8 @@ class BotInterface:
         
         summary = (
             "✅ SETUP COMPLETE\n\n"
-            f"🔹 Exchange: {config_manager.get('exchange_id')}\n"
-            f"🔹 Exec Mode: {config_manager.get('execution_mode')}\n"
+            f"🔹 Exchange: Revolut X\n"
+            f"🔹 Exec Mode: LIVE\n"
             f"🔹 Symbol: {config_manager.get('symbol')}\n"
             f"🔹 Max Capital: 100 USDC\n"
             f"🔹 Stock Alerts: {config_manager.get('stock_alerts_enabled')}\n"
@@ -347,9 +312,9 @@ class BotInterface:
     async def status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         status = "RUNNING" if self.trader.is_running else "PAUSED"
         ip = config_manager.get("static_ip")
-        symbol = config_manager.get("symbol", "BTC/USDT")
-        exchange_id = config_manager.get("exchange_id", "kraken")
-        mode = config_manager.get("execution_mode", "paper")
+        symbol = config_manager.get("symbol", "BTC_USDC")
+        exchange_id = config_manager.get("exchange_id", "revolutx")
+        mode = config_manager.get("execution_mode", "live")
         price = self.trader.last_price
         ts = self.trader.last_price_ts
         await update.message.reply_text(

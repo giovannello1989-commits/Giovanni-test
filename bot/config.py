@@ -5,16 +5,26 @@ from typing import Dict, Any
 CONFIG_FILE = "user_config.json"
 
 DEFAULT_CONFIG = {
-    # Exchange integration (ccxt)
-    # Use public endpoints for market data if api_key/secret are empty.
-    "exchange_id": "kraken",          # e.g. kraken, binance, coinbase, okx...
+    # Exchange integration
+    # - "revolutx" uses Revolut X REST + Ed25519 signatures
+    # - others (kraken/binance/...) use ccxt (kept for fallback/dev)
+    "exchange_id": "revolutx",
+    "execution_mode": "live",  # paper | live
+
+    # Revolut X credentials (LIVE)
+    "revolutx_api_key": "",
+    # PEM text stored locally (NOT committed; user_config.json is gitignored)
+    "revolutx_private_key_pem": "",
+    "revolutx_base_url": "https://api.revolutx.com",
+
+    # ccxt (fallback/dev)
     "exchange_api_key": "",
     "exchange_api_secret": "",
     "sandbox_mode": False,
-    "execution_mode": "paper",        # paper | live
 
     # Trading settings
-    "symbol": "BTC/USDT",
+    # Revolut X uses symbols like "BTC_USDC"
+    "symbol": "BTC_USDC",
     "max_capital": 100.0,
     "bet_usd": 20.0,
     "trade_interval_seconds": 60,

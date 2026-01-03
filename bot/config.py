@@ -5,13 +5,60 @@ from typing import Dict, Any
 CONFIG_FILE = "user_config.json"
 
 DEFAULT_CONFIG = {
-    "revolut_api_key": "",
-    "revolut_api_secret": "",  # If needed, usually just one key for some APIs
+    # Exchange integration
+    # - "revolutx" uses Revolut X REST + Ed25519 signatures
+    # - others (kraken/binance/...) use ccxt (kept for fallback/dev)
+    "exchange_id": "revolutx",
+    "execution_mode": "live",  # paper | live
+
+    # Revolut X credentials (LIVE)
+    "revolutx_api_key": "",
+    # PEM text stored locally (NOT committed; user_config.json is gitignored)
+    "revolutx_private_key_pem": "",
+    # Optional: read PEM from local file instead of Telegram
+    "revolutx_private_key_path": "private.pem",
+    "revolutx_base_url": "https://api.revolutx.com",
+
+    # ccxt (fallback/dev)
+    "exchange_api_key": "",
+    "exchange_api_secret": "",
+    "sandbox_mode": False,
+
+    # Trading settings
+    # Revolut X uses symbols like "BTC_USDC"
+    "symbol": "BTC_USDC",
     "max_capital": 100.0,
-    "trading_style": "test_mode",
+    "bet_usd": 20.0,
+    "trade_interval_seconds": 60,
+
+    # Crypto strategy: short-term momentum + trailing stop
+    "timeframe": "1m",
+    "ohlcv_limit": 200,
+    "crypto_lookback_bars": 5,
+    "crypto_rise_threshold_pct": 0.25,
+    "crypto_fall_threshold_pct": 0.25,
+    "crypto_trailing_window_bars": 30,
+    "crypto_trailing_stop_pct": 0.30,
+
+    # Optional legacy key (kept to avoid breaking existing configs)
+    "revolut_api_key": "",
+    "revolut_api_secret": "",
+
+    # Stock alerts (separate feature)
     "stock_alerts_enabled": False,
     "stock_market": "US",
     "alert_aggressiveness": "medium",
+
+    # Forex alerts (manual trading; bot only notifies)
+    # Watch symbols like: "EURUSD=X", "GBPUSD=X", "USDJPY=X"
+    "forex_alerts_enabled": True,
+    "forex_poll_interval_seconds": 60,
+    "forex_default_interval": "1m",
+    "forex_default_lookback_bars": 5,
+    "forex_default_rise_threshold_pct": 0.05,
+    "forex_default_fall_threshold_pct": 0.05,
+
+    # Ops
     "static_ip": None,
     "is_configured": False
 }

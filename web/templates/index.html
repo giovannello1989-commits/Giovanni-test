@@ -1,0 +1,128 @@
+<!doctype html>
+<html lang="it">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta http-equiv="refresh" content="5" />
+    <title>Trading Bot - Local Dashboard</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <div class="container">
+      <header class="header">
+        <div>
+          <div class="title">Trading Bot</div>
+          <div class="subtitle">Dashboard locale (refresh automatico ogni 5s)</div>
+        </div>
+        <div class="pill {% if bot_running %}pill--on{% else %}pill--off{% endif %}">
+          {% if bot_running %}RUNNING{% else %}STOPPED{% endif %}
+        </div>
+      </header>
+
+      <div class="grid">
+        <section class="card">
+          <h2>Status</h2>
+          <div class="kv">
+            <div class="k">Exchange</div><div class="v">{{ exchange_id }}</div>
+            <div class="k">Mode</div><div class="v">{{ execution_mode }}</div>
+            <div class="k">Symbol</div><div class="v">{{ symbol }}</div>
+            <div class="k">Last price</div><div class="v">{{ last_price }}</div>
+            <div class="k">Last price ts</div><div class="v">{{ last_price_ts }}</div>
+            <div class="k">Exposure</div><div class="v">{{ exposure }} / {{ max_capital }}</div>
+          </div>
+        </section>
+
+        <section class="card">
+          <h2>Controlli</h2>
+          <div class="row">
+            <form method="post" action="/start">
+              <button class="btn btn--primary" type="submit">Start</button>
+            </form>
+            <form method="post" action="/stop">
+              <button class="btn btn--danger" type="submit">Stop</button>
+            </form>
+            <form method="post" action="/trade-once">
+              <button class="btn" type="submit">Trade 1 volta</button>
+            </form>
+          </div>
+          <p class="muted">
+            Nota: se sei in <b>LIVE</b>, “Trade 1 volta” può inviare ordini reali.
+          </p>
+        </section>
+
+        <section class="card card--full">
+          <h2>Configurazione (locale)</h2>
+          <form method="post" action="/config" class="form">
+            <div class="form-grid">
+              <label>
+                <span>Exchange</span>
+                <select name="exchange_id">
+                  <option value="revolutx" {% if exchange_id == "revolutx" %}selected{% endif %}>revolutx</option>
+                  <option value="kraken" {% if exchange_id == "kraken" %}selected{% endif %}>kraken (fallback)</option>
+                  <option value="binance" {% if exchange_id == "binance" %}selected{% endif %}>binance (fallback)</option>
+                </select>
+              </label>
+
+              <label>
+                <span>Execution mode</span>
+                <select name="execution_mode">
+                  <option value="paper" {% if execution_mode == "paper" %}selected{% endif %}>paper</option>
+                  <option value="live" {% if execution_mode == "live" %}selected{% endif %}>live</option>
+                </select>
+              </label>
+
+              <label>
+                <span>Symbol</span>
+                <input name="symbol" value="{{ symbol }}" />
+              </label>
+
+              <label>
+                <span>Bet (USDC)</span>
+                <input name="bet_usd" value="{{ bet_usd }}" />
+              </label>
+
+              <label>
+                <span>Interval seconds</span>
+                <input name="trade_interval_seconds" value="{{ trade_interval_seconds }}" />
+              </label>
+
+              <label>
+                <span>Max capital</span>
+                <input name="max_capital" value="{{ max_capital }}" />
+              </label>
+
+              <label class="span2">
+                <span>Revolut X API Key</span>
+                <input name="revolutx_api_key" value="{{ revolutx_api_key }}" />
+              </label>
+
+              <label class="span2">
+                <span>Revolut X private key path (es. private.pem)</span>
+                <input name="revolutx_private_key_path" value="{{ revolutx_private_key_path }}" />
+              </label>
+            </div>
+
+            <div class="row">
+              <button class="btn btn--primary" type="submit">Salva config</button>
+              <div class="muted">
+                La config viene salvata in <code>user_config.json</code> (locale).
+              </div>
+            </div>
+          </form>
+        </section>
+
+        <section class="card card--full">
+          <h2>Log recenti</h2>
+          <div class="logs">
+            {% for line in logs %}
+              <div class="logline">{{ line }}</div>
+            {% else %}
+              <div class="muted">Nessun log ancora.</div>
+            {% endfor %}
+          </div>
+        </section>
+      </div>
+    </div>
+  </body>
+</html>
+
